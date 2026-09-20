@@ -7,11 +7,9 @@ on:
         description: "Kernel source repo URL for marble (Melt Kernel). Paste any git URL here to override the default."
         required: true
         type: choice
-        default: "https://github.com/yudharn/Pzqqt-Melt-Rebase"
+        default: "https://github.com/yudharn/Build-kernel-Experimental"
         options:
-          - https://github.com/yudharn/Pzqqt-Melt-Rebase
-          - https://github.com/Yudharmdn/Guxin12-Melt-Rebase
-          - https://github.com/Pzqqt/android_kernel_xiaomi_marble
+          - https://github.com/yudharn/Build-kernel-Experimental
 
       kernel_branch:
         description: "Branch on kernel_source above"
@@ -20,8 +18,6 @@ on:
         default: "melt-rebase"
         options:
           - melt-rebase
-          - melt-Guxin12-A
-          - Yudharn-melt-rebase
 
       manager_official_kernelsu:
         description: "Build Official-KernelSU"
@@ -143,8 +139,74 @@ jobs:
           echo "==> Build modes selected for this run: ${MODES[*]} (each ticked mode is built for every checked manager)"
           echo "modes=${MODES_JSON}" >> "$GITHUB_OUTPUT"
 
-  Build_Kernel_Marble:
+  Resolve_Toolchain:
     needs: Determine_Matrix
+    name: Resolve latest LLVM/Clang release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      llvm_tag: ${{ steps.resolve.outputs.llvm_tag }}
+      clang_url: ${{ steps.resolve.outputs.clang_url }}
+      clang_archive: ${{ steps.resolve.outputs.clang_archive }}
+    steps:
+      - name: Query GitHub API (authenticated, with retry)
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          echo "==> Querying latest stable LLVM release..."
+
+          LLVM_JSON=""
+          for attempt in 1 2 3; do
+            if LLVM_JSON=$(curl -fsSL \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                https://api.github.com/repos/llvm/llvm-project/releases/latest); then
+              break
+            fi
+            echo "::warning::GitHub API call failed (attempt ${attempt}/3), retrying in 5s..."
+            sleep 5
+          done
+
+          if [[ -z "$LLVM_JSON" ]]; then
+            echo "::error::Could not reach the GitHub API after 3 attempts."
+            exit 1
+          fi
+
+          LLVM_TAG=$(echo "$LLVM_JSON" | jq -r '.tag_name')
+
+          CLANG_URL=$(echo "$LLVM_JSON" | jq -r '
+            .assets[]
+            | select(.name | test("Linux-X64\\.tar\\.xz$"))
+            | .browser_download_url
+          ' | head -n 1)
+
+          if [[ -z "$LLVM_TAG" || "$LLVM_TAG" == "null" ]]; then
+            echo "::error::Failed to determine latest LLVM release tag."
+            exit 1
+          fi
+
+          if [[ -z "$CLANG_URL" || "$CLANG_URL" == "null" ]]; then
+            echo "::error::Could not find Linux-X64.tar.xz asset in LLVM release ${LLVM_TAG}."
+            echo "Available assets:"
+            echo "$LLVM_JSON" | jq -r '.assets[].name'
+            exit 1
+          fi
+
+          CLANG_ARCHIVE=$(basename "$CLANG_URL")
+
+          echo "llvm_tag=${LLVM_TAG}" >> "$GITHUB_OUTPUT"
+          echo "clang_url=${CLANG_URL}" >> "$GITHUB_OUTPUT"
+          echo "clang_archive=${CLANG_ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+          echo "==> Latest LLVM release: ${LLVM_TAG}"
+
+  Build_Kernel_Marble:
+    needs: [Determine_Matrix, Resolve_Toolchain]
     name: Build Kernel (${{ matrix.ksu_type }} / ${{ matrix.build_mode }})
     strategy:
       fail-fast: false
@@ -256,57 +318,44 @@ jobs:
           echo "==> Detected kernel base version: ${KERNEL_BASE_VERSION}"
           cd ..
 
-      - name: Download Latest Clang/LLVM Toolchain
-        id: clang
+      - name: Use resolved LLVM/Clang release
+        run: |
+          echo "LLVM_TAG=${{ needs.Resolve_Toolchain.outputs.llvm_tag }}" >> "$GITHUB_ENV"
+          echo "CLANG_URL=${{ needs.Resolve_Toolchain.outputs.clang_url }}" >> "$GITHUB_ENV"
+          echo "CLANG_ARCHIVE=${{ needs.Resolve_Toolchain.outputs.clang_archive }}" >> "$GITHUB_ENV"
+          echo "==> Using LLVM release: ${{ needs.Resolve_Toolchain.outputs.llvm_tag }}"
+
+      - name: Restore cached Clang/LLVM toolchain
+        id: toolchain-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: toolchains/llvm-toolchain
+          key: llvm-toolchain-${{ needs.Resolve_Toolchain.outputs.llvm_tag }}
+
+      - name: Download & extract Clang/LLVM toolchain (cache miss only)
+        if: ${{ steps.toolchain-cache.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
-
+          echo "==> Cache miss for ${LLVM_TAG} — downloading from ${CLANG_URL}"
           mkdir -p toolchains
           cd toolchains
-
-          echo "==> Querying latest stable LLVM release..."
-
-          LLVM_JSON=$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/llvm/llvm-project/releases/latest)
-
-          LLVM_TAG=$(echo "$LLVM_JSON" | jq -r '.tag_name')
-
-          CLANG_URL=$(echo "$LLVM_JSON" | jq -r '
-            .assets[]
-            | select(.name | test("Linux-X64\\.tar\\.xz$"))
-            | .browser_download_url
-          ' | head -n 1)
-
-          if [[ -z "$LLVM_TAG" || "$LLVM_TAG" == "null" ]]; then
-            echo "::error::Failed to determine latest LLVM release tag."
-            exit 1
-          fi
-
-          if [[ -z "$CLANG_URL" || "$CLANG_URL" == "null" ]]; then
-            echo "::error::Could not find Linux-X64.tar.xz asset in LLVM release ${LLVM_TAG}."
-            echo "Available assets:"
-            echo "$LLVM_JSON" | jq -r '.assets[].name'
-            exit 1
-          fi
-
-          CLANG_ARCHIVE=$(basename "$CLANG_URL")
-
-          echo "LLVM_TAG=${LLVM_TAG}" >> "$GITHUB_ENV"
-          echo "CLANG_URL=${CLANG_URL}" >> "$GITHUB_ENV"
-          echo "CLANG_ARCHIVE=${CLANG_ARCHIVE}" >> "$GITHUB_ENV"
-
-          echo "==> Latest LLVM release: ${LLVM_TAG}"
-          echo "==> Download URL: ${CLANG_URL}"
-
           wget -q "$CLANG_URL" -O "$CLANG_ARCHIVE"
           mkdir llvm-toolchain
           tar -xJf "$CLANG_ARCHIVE" -C llvm-toolchain --strip-components=1 >/dev/null 2>&1
           rm -f "$CLANG_ARCHIVE"
 
-          echo "==> Downloaded Clang version:"
-          llvm-toolchain/bin/clang --version
+      - name: Save Clang/LLVM toolchain to cache
+        if: ${{ always() && steps.toolchain-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: toolchains/llvm-toolchain
+          key: llvm-toolchain-${{ needs.Resolve_Toolchain.outputs.llvm_tag }}
+
+      - name: Report Clang/LLVM toolchain
+        id: clang
+        run: |
+          echo "==> Using Clang/LLVM toolchain: ${LLVM_TAG} (cache-hit: ${{ steps.toolchain-cache.outputs.cache-hit }})"
+          toolchains/llvm-toolchain/bin/clang --version
 
       - name: Configure ccache dir and key
         run: |
@@ -417,6 +466,8 @@ jobs:
                 echo "==> ReSukiSU: using latest commit on main"
                 curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
               fi
+                echo "==> ReSukiSU: pulling submodules"
+                env -u CI -u GITHUB_ACTIONS bash ./KernelSU/kernel/setup.sh --submodule
               ;;
 
             "SukiSUUltra")
@@ -546,17 +597,14 @@ jobs:
           fi
 
           if [[ "${{ env.NOMOUNT }}" == true ]]; then
-             echo "::group::NoMount integration"
-          if [[ "${{ inputs.susfs }}" == true ]]; then
-             echo "::warning::susfs and nomount are both enabled - susfs's SUS_KSTAT patches fs/stat.c, which nomount's own VFS hooks may also touch. If anything below fails, try disabling one to isolate it."
-          fi
+            echo "::group::NoMount integration"
 
             if [[ -n "${{ inputs.nomount_commit }}" ]]; then
               echo "==> NoMount: using custom commit/tag ${{ inputs.nomount_commit }}"
-              curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash -s "${{ inputs.nomount_commit }}"
+              curl https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh | bash -s "${{ inputs.nomount_commit }}"
             else
               echo "==> NoMount: using latest commit on master"
-              curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash -s master
+              curl https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh | bash -s master
             fi
 
             if [[ -d "NoMount/.git" ]]; then
@@ -773,7 +821,14 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ github.token }}
+      # Release target (yudharn/POCOF5-Melt-Rebase-Kernel-Marble) is a different
+      # repo than the one this workflow runs in, so the default GITHUB_TOKEN
+      # (github.token) can't publish there — it only has permissions scoped to
+      # this repo. RELEASE_PAT must be a PAT (classic "repo" scope, or
+      # fine-grained with Contents: Read & write) added as a secret on
+      # whichever repo hosts this workflow, granting access to the release repo.
+      GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+      RELEASE_REPO: yudharn/POCOF5-Melt-Rebase-Kernel-Marble
     permissions:
       contents: write
       actions: read
@@ -905,7 +960,7 @@ jobs:
           BUILD_TIME=$(date -u +"%Y%m%d_%H%M")
           REL_NAME="${KERNEL_BASE_VERSION}-${KERNEL_NAME}-${BUILD_TIME}"
 
-          gh release create "$REL_NAME" -R ${{ github.repository }} --title "$REL_NAME" --notes "# Kernel Melt Rebase for POCO F5 (marble)
+          gh release create "$REL_NAME" -R "${RELEASE_REPO}" --title "$REL_NAME" --notes "# Kernel Melt Rebase for POCO F5 (marble)
 
            | | |
            |:---|:---|
@@ -946,6 +1001,8 @@ jobs:
 
            ---
           " "${ASSETS[@]}"
+
+
 
 
 
