@@ -15,9 +15,10 @@ on:
         description: "Branch on kernel_source above"
         required: true
         type: choice
-        default: "melt-rebase"
+        default: "Yudharn-melt-rebase"
         options:
           - melt-rebase
+          - Yudharn-melt-rebase
 
       manager_official_kernelsu:
         description: "Build Official-KernelSU"
