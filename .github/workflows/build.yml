@@ -558,33 +558,12 @@ jobs:
             cp ./kernel_patches/fs/* ../fs/
             cp ./kernel_patches/include/linux/* ../include/linux/
 
-            # Fix: some susfs4ksu fs/susfs.c revisions call security_sb_statfs()
-            # (used inside susfs_sus_kstat_spoof_vfs_statfs()) without including
-            # <linux/security.h>, which trips Clang -Werror with:
-            #   ../fs/susfs.c:284:11: error: implicit declaration of function
-            #   'security_sb_statfs'
-            # Prepend the include; harmless no-op if it's already there thanks
-            # to the header's own include guard.
-            sed -i '1i #include <linux/security.h>' ../fs/susfs.c
-
             SUSFS_VERSION_TAG=$(sed -n 's/.*SUSFS_VERSION[[:space:]]*"\([^"]*\)".*/\1/p' kernel_patches/include/linux/susfs.h | head -n1)
             echo "SUSFS_VERSION_TAG=${SUSFS_VERSION_TAG:-unknown}" >> $GITHUB_ENV
             echo "==> SUSFS: detected version ${SUSFS_VERSION_TAG:-unknown} from susfs.h"
 
             cd ..
             patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch
-
-            # Fix: the upstream gki-android12-5.10 susfs patch declares the
-            # susfs_is_inode_sus_kstat()/susfs_sus_kstat_spoof_vfs_statfs()
-            # externs after vfs_get_fsid(), past their first call site in
-            # susfs_statfs_by_dentry(), which trips Clang -Werror with:
-            #   ../fs/statfs.c:88:6: error: implicit declaration of function
-            #   'susfs_sus_kstat_spoof_vfs_statfs'
-            # Overwrite with pre-fixed fs/stat.c and fs/statfs.c (externs
-            # moved above the helper) until upstream fixes it.
-            # Ref: https://github.com/kaminarich/GKI-Kernel/commit/67a32d6e21fbd927913e957592f3c2960f7247a6
-            cp "${GITHUB_WORKSPACE}/kernel_fixes/fs/stat.c" fs/stat.c
-            cp "${GITHUB_WORKSPACE}/kernel_fixes/fs/statfs.c" fs/statfs.c
 
             echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/marble_defconfig
