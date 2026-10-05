@@ -32,23 +32,11 @@ on:
         type: boolean
         default: true
 
-      manager_kowsu:
-        description: "Build KowSU"
-        required: true
-        type: boolean
-        default: false
-
-      manager_resukisu:
-        description: "Build ReSukiSU"
+      manager_bakasu:
+        description: "Build BakaSU"
         required: true
         type: boolean
         default: true
-
-      resukisu_commit:
-        description: "Custom ReSukiSU commit or tag. Leave empty to use the latest commit on main."
-        required: false
-        type: string
-        default: ""
 
       manager_sukisu_ultra:
         description: "Build SukiSUUltra"
@@ -111,8 +99,7 @@ jobs:
           MANAGERS=()
           [[ "${{ inputs.manager_official_kernelsu }}" == true ]] && MANAGERS+=("Official-KernelSU")
           [[ "${{ inputs.manager_kernelsu_next }}" == true ]] && MANAGERS+=("KernelSU-Next")
-          [[ "${{ inputs.manager_kowsu }}" == true ]] && MANAGERS+=("KowSU")
-          [[ "${{ inputs.manager_resukisu }}" == true ]] && MANAGERS+=("ReSukiSU")
+          [[ "${{ inputs.manager_bakasu }}" == true ]] && MANAGERS+=("BakaSU")
           [[ "${{ inputs.manager_sukisu_ultra }}" == true ]] && MANAGERS+=("SukiSUUltra")
 
           if [[ ${#MANAGERS[@]} -eq 0 ]]; then
@@ -447,10 +434,6 @@ jobs:
               curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
               ;;
 
-            "KowSU")
-               curl -LSs "https://raw.githubusercontent.com/KOWX712/KernelSU/main/kernel/setup.sh" | bash -s master
-              ;;
-
             "KernelSU-Next")
               if [[ "${{ env.SUSFS }}" == true ]]; then
                 curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
@@ -459,16 +442,8 @@ jobs:
               fi
               ;;
 
-            "ReSukiSU")
-              if [[ -n "${{ inputs.resukisu_commit }}" ]]; then
-                echo "==> ReSukiSU: using custom commit/tag ${{ inputs.resukisu_commit }}"
-                curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "${{ inputs.resukisu_commit }}"
-              else
-                echo "==> ReSukiSU: using latest commit on main"
-                curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
-              fi
-                echo "==> ReSukiSU: pulling submodules"
-                env -u CI -u GITHUB_ACTIONS bash ./KernelSU/kernel/setup.sh --submodule
+            "BakaSU")
+              curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
               ;;
 
             "SukiSUUltra")
@@ -487,23 +462,19 @@ jobs:
 
               # Each fork computes its own version code in kernel/Kbuild (KSU_VERSION),
               # this mirrors that formula so the release notes match what the manager
-              # app itself reports, e.g. ReSukiSU shows "v4.2.0-rc1 (35119)".
+              # app itself reports, e.g. BakaSU shows "v4.2.0-rc1 (35119)".
               KSU_REV_COUNT=$(cd "$KSU_DIR" && git rev-list --count HEAD 2>/dev/null || echo "")
               KSU_TAG=""
               KSU_CODE=""
 
               case "${{ matrix.ksu_type }}" in
-                "Official-KernelSU"|"KowSU")
+                "Official-KernelSU")
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --always 2>/dev/null || echo "")
                   [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((30000 + KSU_REV_COUNT))
                   ;;
                 "KernelSU-Next")
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo "")
                   [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((30000 + KSU_REV_COUNT))
-                  ;;
-                "ReSukiSU")
-                  KSU_TAG=$(cd "$KSU_DIR" && git describe --abbrev=0 --tags 2>/dev/null || echo "")
-                  [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((30000 + KSU_REV_COUNT + 700))
                   ;;
                 "SukiSUUltra")
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo "")
