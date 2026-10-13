@@ -32,17 +32,17 @@ on:
         type: boolean
         default: true
 
+      manager_kernelsu_next_lkm:
+        description: "Build KernelSU-Next + SuSFS LKM (no built-in SuSFS; SuSFS-LKM_*.zip attached to release)"
+        required: true
+        type: boolean
+        default: true
+
       manager_bakasu:
         description: "Build BakaSU"
         required: true
         type: boolean
         default: true
-
-      manager_sukisu_ultra:
-        description: "Build SukiSUUltra"
-        required: true
-        type: boolean
-        default: false
 
       custom_name:
         description: "kernel"
@@ -70,11 +70,23 @@ on:
         type: string
         default: ""
 
+      susfs_lkm_tag:
+        description: "SuSFS LKM release tag (inforcqb/susfs4ksu-lkm). Leave empty to use the latest release."
+        required: false
+        type: string
+        default: ""
+
       nomount_commit:
         description: "Custom NoMount commit or tag. Leave empty to use the latest commit on master."
         required: false
         type: string
         default: ""
+
+      include_manager_apk:
+        description: "Attach the matching manager APK (latest successful CI build of each manager) to the release"
+        required: true
+        type: boolean
+        default: true
 
       ccache_update:
         description: "Refresh ccache"
@@ -99,8 +111,8 @@ jobs:
           MANAGERS=()
           [[ "${{ inputs.manager_official_kernelsu }}" == true ]] && MANAGERS+=("Official-KernelSU")
           [[ "${{ inputs.manager_kernelsu_next }}" == true ]] && MANAGERS+=("KernelSU-Next")
+          [[ "${{ inputs.manager_kernelsu_next_lkm }}" == true ]] && MANAGERS+=("KernelSU-Next-LKM")
           [[ "${{ inputs.manager_bakasu }}" == true ]] && MANAGERS+=("BakaSU")
-          [[ "${{ inputs.manager_sukisu_ultra }}" == true ]] && MANAGERS+=("SukiSUUltra")
 
           if [[ ${#MANAGERS[@]} -eq 0 ]]; then
             echo "::error::No manager checked — tick at least one manager_* checkbox before running this workflow."
@@ -248,6 +260,8 @@ jobs:
             REKERNEL_EBPF=true
             DROIDSPACES=false
           fi
+          # SuSFS LKM must never stack with built-in SuSFS
+          [[ "${{ matrix.ksu_type }}" == "KernelSU-Next-LKM" ]] && SUSFS=false
           echo "SUSFS=${SUSFS}" >> $GITHUB_ENV
           echo "NOMOUNT=${NOMOUNT}" >> $GITHUB_ENV
           echo "BBG=${BBG}" >> $GITHUB_ENV
@@ -434,7 +448,7 @@ jobs:
               curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
               ;;
 
-            "KernelSU-Next")
+            "KernelSU-Next"|"KernelSU-Next-LKM")
               if [[ "${{ env.SUSFS }}" == true ]]; then
                 curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
               else
@@ -446,9 +460,6 @@ jobs:
               curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
               ;;
 
-            "SukiSUUltra")
-              curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
-              ;;              
           esac
 
           if [[ "${{ matrix.ksu_type }}" != "None" ]]; then
@@ -457,6 +468,8 @@ jobs:
 
             if [[ -n "$KSU_DIR" && -d "${KSU_DIR}/.git" ]]; then
               KSU_MANAGER_COMMIT=$(cd "$KSU_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "")
+              KSU_MANAGER_SHA=$(cd "$KSU_DIR" && git rev-parse HEAD 2>/dev/null || echo "")
+              echo "KSU_MANAGER_SHA=${KSU_MANAGER_SHA}" >> $GITHUB_ENV
               KSU_MANAGER_REPO_URL=$(cd "$KSU_DIR" && git remote get-url origin 2>/dev/null | sed 's/\.git$//')
               KSU_MANAGER_COMMIT_URL="${KSU_MANAGER_REPO_URL}/commit/${KSU_MANAGER_COMMIT}"
 
@@ -472,13 +485,9 @@ jobs:
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --always 2>/dev/null || echo "")
                   [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((30000 + KSU_REV_COUNT))
                   ;;
-                "KernelSU-Next")
+                "KernelSU-Next"|"KernelSU-Next-LKM")
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo "")
                   [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((30000 + KSU_REV_COUNT))
-                  ;;
-                "SukiSUUltra")
-                  KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo "")
-                  [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((40000 + KSU_REV_COUNT - 2815))
                   ;;
                 *)
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --always 2>/dev/null || echo "")
@@ -637,6 +646,15 @@ jobs:
 
           echo "-${KERNEL_NAME}-${{ github.actor }}" > .scmversion
 
+          # susfs-lkm-module picks the .ko from osrelease (needs "5.10.*-android12-*").
+          # CONFIG_LOCALVERSION_AUTO is off on this tree, so .scmversion is ignored -> patch CONFIG_LOCALVERSION.
+          if [[ "${{ matrix.ksu_type }}" == "KernelSU-Next-LKM" ]] && ! grep -q '^CONFIG_LOCALVERSION=".*-android12-' arch/arm64/configs/marble_defconfig; then
+            sed -i 's/^CONFIG_LOCALVERSION="\(.*\)"$/CONFIG_LOCALVERSION="-android12-9\1"/' arch/arm64/configs/marble_defconfig
+            grep -q '^CONFIG_LOCALVERSION="-android12-9' arch/arm64/configs/marble_defconfig \
+              || echo 'CONFIG_LOCALVERSION="-android12-9"' >> arch/arm64/configs/marble_defconfig
+            echo "==> SuSFS LKM: $(grep '^CONFIG_LOCALVERSION=' arch/arm64/configs/marble_defconfig)"
+          fi
+
           echo "CONFIG_TMPFS_XATTR=y" >> arch/arm64/configs/marble_defconfig
 
           echo "CONFIG_BPF_SYSCALL=y" >> arch/arm64/configs/marble_defconfig
@@ -660,6 +678,16 @@ jobs:
 
           echo "ccache status after build:"
           ccache -s
+
+      - name: Verify kernel release (SuSFS LKM KMI)
+        if: ${{ matrix.ksu_type == 'KernelSU-Next-LKM' }}
+        run: |
+          KREL=$(cat ${SOC}/out/include/config/kernel.release)
+          echo "==> kernel.release: ${KREL}"
+          case "$KREL" in
+            5.10.*-android12-*) echo "==> OK: susfs-lkm-module will select android12-5.10" ;;
+            *) echo "::error::kernel.release '${KREL}' does not match 5.10.*-android12-* - SuSFS LKM would refuse to load"; exit 1 ;;
+          esac
 
       - name: Save ccache
         if: ${{ always() && steps.ccache-restore.outputs.cache-hit != 'true' }}
@@ -709,6 +737,8 @@ jobs:
 
           if [[ "${{ env.SUSFS }}" == true ]]; then
             ZIP_NAME="${ZIP_NAME}-SuSFS"
+          elif [[ "${{ matrix.ksu_type }}" == "KernelSU-Next-LKM" ]]; then
+            ZIP_NAME="${ZIP_NAME}-SuSFS-LKM"
           fi
 
           if [[ "${{ env.NOMOUNT }}" == true ]]; then
@@ -730,6 +760,77 @@ jobs:
 
           echo "ZIP_NAME=${ZIP_NAME}.zip" >> $GITHUB_ENV
 
+      - name: Fetch ${{ matrix.ksu_type }} manager APK (CI)
+        if: ${{ inputs.include_manager_apk }}
+        continue-on-error: true
+        env:
+          PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          set -uo pipefail
+          KSU_TYPE="${{ matrix.ksu_type }}"
+          # "<repo> <branch> <workflow file> <artifact name regex>", tried in order
+          case "$KSU_TYPE" in
+            "Official-KernelSU") CANDS=("tiann/KernelSU main build-manager.yml ^manager$") ;;
+            "KernelSU-Next"|"KernelSU-Next-LKM")
+              CANDS=()
+              [[ "${SUSFS}" == true ]] && CANDS+=("pershoot/KernelSU-Next dev-susfs build-manager-ci.yml ^manager$")
+              CANDS+=("KernelSU-Next/KernelSU-Next dev build-manager-ci.yml ^manager$") ;;
+            "BakaSU") CANDS=("Baka-SU/BakaSU main build-manager.yml ^Manager-release$") ;;
+            *) echo "==> No manager CI known for ${KSU_TYPE}"; exit 0 ;;
+          esac
+
+          # github.token first, RELEASE_PAT as fallback (cross-repo artifact access)
+          api() { gh api "$@" 2>/dev/null || { [[ -n "${PAT}" ]] && GH_TOKEN="${PAT}" gh api "$@"; }; }
+          api_dl() { gh api "$1" > "$2" 2>/dev/null || { [[ -n "${PAT}" ]] && GH_TOKEN="${PAT}" gh api "$1" > "$2"; }; }
+
+          for c in "${CANDS[@]}"; do
+            read -r REPO BRANCH WF ART_RE <<<"$c"
+            RUN_JSON=""
+            MATCH=latest
+            if [[ -n "${KSU_MANAGER_SHA:-}" ]]; then
+              RUN_JSON=$(api "repos/${REPO}/actions/workflows/${WF}/runs?branch=${BRANCH}&status=success&head_sha=${KSU_MANAGER_SHA}&per_page=1" --jq '.workflow_runs[0] // empty')
+              [[ -n "$RUN_JSON" ]] && MATCH=exact
+            fi
+            if [[ -z "$RUN_JSON" ]]; then
+              RUN_JSON=$(api "repos/${REPO}/actions/workflows/${WF}/runs?branch=${BRANCH}&event=push&status=success&per_page=1" --jq '.workflow_runs[0] // empty')
+            fi
+            if [[ -z "$RUN_JSON" ]]; then
+              echo "==> ${REPO}@${BRANCH}: no successful ${WF} run"
+              continue
+            fi
+            RUN_ID=$(jq -r '.id' <<<"$RUN_JSON")
+            RUN_SHA=$(jq -r '.head_sha[0:8]' <<<"$RUN_JSON")
+            RUN_URL=$(jq -r '.html_url' <<<"$RUN_JSON")
+
+            ART_ID=$(api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
+              --jq "[.artifacts[] | select(.expired | not) | select(.name | test(\"${ART_RE}\"))][0].id // empty")
+            if [[ -z "$ART_ID" ]]; then
+              echo "==> ${RUN_URL}: no unexpired artifact matching ${ART_RE}"
+              continue
+            fi
+
+            rm -rf mgr-dl && mkdir -p mgr-dl
+            if ! api_dl "repos/${REPO}/actions/artifacts/${ART_ID}/zip" mgr-dl/artifact.zip; then
+              echo "::warning::Artifact download from ${RUN_URL} failed (token cannot read cross-repo artifacts? set RELEASE_PAT)."
+              continue
+            fi
+            unzip -q -o mgr-dl/artifact.zip -d mgr-dl
+            APK=$(find mgr-dl -name '*.apk' ! -iname '*spoof*' ! -iname '*debug*' | sort | head -n1)
+            [[ -z "$APK" ]] && { echo "==> no APK inside artifact ${ART_ID}"; continue; }
+
+            OUT="${KSU_TYPE}_Manager_$(basename "$APK")"
+            cp "$APK" "$OUT"
+            {
+              echo "MANAGER_APK=${OUT}"
+              echo "MANAGER_APK_URL=${RUN_URL}"
+              echo "MANAGER_APK_MATCH=${MATCH}"
+              echo "MANAGER_APK_SHA=${RUN_SHA}"
+            } >> "$GITHUB_ENV"
+            echo "==> ${OUT} <- ${REPO}@${RUN_SHA} (${MATCH} match to kernel ${KSU_MANAGER_COMMIT:-?}) ${RUN_URL}"
+            exit 0
+          done
+          echo "::warning::Could not fetch a ${KSU_TYPE} manager APK - this release will not include it."
+
       - name: Write build metadata
         run: |
           jq -n \
@@ -750,7 +851,11 @@ jobs:
             --arg nomount_commit "${NOMOUNT_COMMIT:-}" \
             --arg nomount_commit_url "${NOMOUNT_COMMIT_URL:-}" \
             --arg nomount_version_tag "${NOMOUNT_VERSION_TAG:-}" \
-            '{ksu_type:$ksu_type,build_mode:$build_mode,kernel_name:$kernel_name,zip_name:$zip_name,ksu_manager_version:$ksu_manager_version,ksu_manager_commit:$ksu_manager_commit,ksu_manager_commit_url:$ksu_manager_commit_url,kernel_commit:$kernel_commit,kernel_commit_url:$kernel_commit_url,kernel_base_version:$kernel_base_version,clang_version:$clang_version,susfs_commit:$susfs_commit,susfs_commit_url:$susfs_commit_url,susfs_version_tag:$susfs_version_tag,nomount_commit:$nomount_commit,nomount_commit_url:$nomount_commit_url,nomount_version_tag:$nomount_version_tag}' \
+            --arg manager_apk "${MANAGER_APK:-}" \
+            --arg manager_apk_url "${MANAGER_APK_URL:-}" \
+            --arg manager_apk_match "${MANAGER_APK_MATCH:-}" \
+            --arg manager_apk_sha "${MANAGER_APK_SHA:-}" \
+            '{manager_apk:$manager_apk,manager_apk_url:$manager_apk_url,manager_apk_match:$manager_apk_match,manager_apk_sha:$manager_apk_sha,ksu_type:$ksu_type,build_mode:$build_mode,kernel_name:$kernel_name,zip_name:$zip_name,ksu_manager_version:$ksu_manager_version,ksu_manager_commit:$ksu_manager_commit,ksu_manager_commit_url:$ksu_manager_commit_url,kernel_commit:$kernel_commit,kernel_commit_url:$kernel_commit_url,kernel_base_version:$kernel_base_version,clang_version:$clang_version,susfs_commit:$susfs_commit,susfs_commit_url:$susfs_commit_url,susfs_version_tag:$susfs_version_tag,nomount_commit:$nomount_commit,nomount_commit_url:$nomount_commit_url,nomount_version_tag:$nomount_version_tag}' \
             > "${GITHUB_WORKSPACE}/metadata.json"
 
       - name: Upload build artifact
@@ -760,14 +865,67 @@ jobs:
           path: |
             ${{ env.ZIP_NAME }}
             metadata.json
-            rekernel.bpf.o
-            rekerneld_aarch64
+            *_Manager_*.apk
           if-no-files-found: ignore
+          retention-days: 1
+
+  Build_SuSFS_LKM:
+    needs: Determine_Matrix
+    if: ${{ inputs.manager_kernelsu_next_lkm }}
+    name: Fetch SuSFS LKM module ZIP
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LKM_REPO: inforcqb/susfs4ksu-lkm
+    steps:
+      - name: Get official susfs_guard_lkm module ZIP (fallback - matsuzaka-yuki wrapper)
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ inputs.susfs_lkm_tag }}" ]]; then
+            REL_JSON=$(gh api "repos/${LKM_REPO}/releases/tags/${{ inputs.susfs_lkm_tag }}")
+          else
+            REL_JSON=$(gh api "repos/${LKM_REPO}/releases/latest")
+          fi
+          TAG=$(jq -r '.tag_name' <<<"$REL_JSON")
+          ASSET=$(jq -r '.assets[].name | select(test("^susfs_guard_lkm-module-.*-arm64\\.zip$"))' <<<"$REL_JSON" | head -n1)
+          echo "==> ${LKM_REPO} release: ${TAG}"
+
+          if [[ -n "$ASSET" ]]; then
+            gh release download "$TAG" -R "$LKM_REPO" -p "$ASSET" -D lkm-dl
+            unzip -Z1 "lkm-dl/${ASSET}" > lkm-list.txt
+            grep -qx 'lib/susfs_guard_lkm-android12-5.10.ko' lkm-list.txt \
+              || { echo "::error::${ASSET} has no android12-5.10 .ko"; exit 1; }
+            OUT="SuSFS-LKM_${TAG}.zip"
+            cp "lkm-dl/${ASSET}" "$OUT"
+            echo "==> Using official upstream module ${ASSET}"
+          else
+            echo "::warning::${TAG} has no official module ZIP - falling back to matsuzaka-yuki/susfs-lkm-module (pinned upstream build)."
+            git clone --depth=1 https://github.com/matsuzaka-yuki/susfs-lkm-module.git lkm
+            export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+            if [[ -z "$ANDROID_NDK_HOME" || ! -d "$ANDROID_NDK_HOME" ]]; then
+              wget -q https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+              unzip -q android-ndk-r27d-linux.zip -d "$HOME"
+              export ANDROID_NDK_HOME="$HOME/android-ndk-r27d"
+            fi
+            (cd lkm && python3 tools/build.py)
+            WRAP_TAG=$(sed -n 's/^TAG = "\(.*\)"$/\1/p' lkm/tools/build.py)
+            OUT="SuSFS-LKM_${WRAP_TAG}_wrapper-$(git -C lkm rev-parse --short HEAD).zip"
+            cp lkm/dist/*.zip "$OUT"
+          fi
+          echo "==> Built ${OUT}"
+          unzip -l "$OUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-susfs-lkm
+          path: SuSFS-LKM_*.zip
           retention-days: 1
 
   Create_Release:
     name: Create combined GitHub Release
-    needs: Build_Kernel_Marble
+    needs: [Build_Kernel_Marble, Build_SuSFS_LKM]
 
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -801,12 +959,12 @@ jobs:
 
           ASSETS=()
           NOTES_ROWS=""
-          EBPF_DONE=false
           FIRST=true
           FOUND_ANY=false
 
           declare -A ROW_VERSION
           declare -A ROW_MODES
+          declare -A ROW_APK
           ORDERED_TYPES=()
 
           while IFS= read -r META; do
@@ -826,16 +984,25 @@ jobs:
               KERNEL_COMMIT_URL=$(jq -r '.kernel_commit_url' "$META")
               KERNEL_BASE_VERSION=$(jq -r '.kernel_base_version' "$META")
               CLANG_VERSION=$(jq -r '.clang_version' "$META")
-              SUSFS_COMMIT=$(jq -r '.susfs_commit' "$META")
-              SUSFS_COMMIT_URL=$(jq -r '.susfs_commit_url' "$META")
-              SUSFS_VERSION_TAG=$(jq -r '.susfs_version_tag' "$META")
               NOMOUNT_COMMIT=$(jq -r '.nomount_commit' "$META")
               NOMOUNT_COMMIT_URL=$(jq -r '.nomount_commit_url' "$META")
               NOMOUNT_VERSION_TAG=$(jq -r '.nomount_version_tag' "$META")
               FIRST=false
             fi
 
+            if [[ -z "${SUSFS_COMMIT:-}" && -n "$(jq -r '.susfs_commit' "$META")" ]]; then
+              SUSFS_COMMIT=$(jq -r '.susfs_commit' "$META")
+              SUSFS_COMMIT_URL=$(jq -r '.susfs_commit_url' "$META")
+              SUSFS_VERSION_TAG=$(jq -r '.susfs_version_tag' "$META")
+            fi
+
             ASSETS+=("${dir}${ZIP_NAME}")
+
+            MANAGER_APK=$(jq -r '.manager_apk // ""' "$META")
+            if [[ -n "$MANAGER_APK" && -f "${dir}${MANAGER_APK}" && -z "${ROW_APK[$KSU_TYPE]+x}" ]]; then
+              ASSETS+=("${dir}${MANAGER_APK}")
+              ROW_APK["$KSU_TYPE"]="\`${MANAGER_APK}\` ([CI $(jq -r '.manager_apk_match' "$META")@$(jq -r '.manager_apk_sha' "$META")]($(jq -r '.manager_apk_url' "$META")))"
+            fi
 
             if [[ -n "$KSU_MANAGER_COMMIT" ]]; then
               ksu_row_version="${KSU_MANAGER_VERSION}@[${KSU_MANAGER_COMMIT}](${KSU_MANAGER_COMMIT_URL})"
@@ -849,11 +1016,6 @@ jobs:
               ROW_MODES["$KSU_TYPE"]="$BUILD_MODE_LEG"
             else
               ROW_MODES["$KSU_TYPE"]="${ROW_MODES[$KSU_TYPE]},${BUILD_MODE_LEG}"
-            fi
-
-            if [[ "$EBPF_DONE" == false && -f "${dir}rekernel.bpf.o" ]]; then
-              ASSETS+=("${dir}rekernel.bpf.o" "${dir}rekerneld_aarch64")
-              EBPF_DONE=true
             fi
           done < <(find . -type f -name 'metadata.json' | sort)
 
@@ -869,12 +1031,20 @@ jobs:
               MODE_LABEL="$MODES_RAW"
             fi
             NOTES_ROWS="${NOTES_ROWS}
-           | ${KSU_TYPE} | ${MODE_LABEL} | ${ROW_VERSION[$KSU_TYPE]} |"
+           | ${KSU_TYPE} | ${MODE_LABEL} | ${ROW_VERSION[$KSU_TYPE]} | ${ROW_APK[$KSU_TYPE]:-—} |"
           done
 
           if [[ ${#ASSETS[@]} -eq 0 ]]; then
             echo "::error::No successful builds found in any matrix leg — skipping release creation."
             exit 1
+          fi
+
+          SUSFS_LKM_ZIP=$(find . -type f -name 'SuSFS-LKM_*.zip' | head -n1)
+          if [[ -n "$SUSFS_LKM_ZIP" ]]; then
+            ASSETS+=("$SUSFS_LKM_ZIP")
+            susfs_lkm_checkbox="Supported ($(basename "$SUSFS_LKM_ZIP"), for KernelSU-Next-LKM zip only)"
+          else
+            susfs_lkm_checkbox="Not built"
           fi
 
           MODES_SELECTED=()
@@ -896,7 +1066,7 @@ jobs:
           fi
 
           rekernel_netlink_checkbox="Supported"
-          rekernel_ebpf_checkbox="Supported (daemon+prog attached as release assets)"
+          rekernel_ebpf_checkbox="Supported"
 
           if [[ -n "$NOMOUNT_COMMIT" ]]; then
             if [[ -n "$NOMOUNT_VERSION_TAG" && "$NOMOUNT_VERSION_TAG" != "unknown" && "$NOMOUNT_VERSION_TAG" != "null" ]]; then
@@ -923,7 +1093,8 @@ jobs:
            | 🧬 Build Modes in this run | ${MODES_LABEL} |
            | 📦 Source | ${{ inputs.kernel_source }} |
            | 🔗 Kernel branch | ${{ inputs.kernel_branch }}@[${KERNEL_COMMIT}](${KERNEL_COMMIT_URL})
-           | ⚙️ SuSFS Version | ${susfs_checkbox} 
+           | ⚙️ SuSFS Version | ${susfs_checkbox}
+           | 🧩 SuSFS LKM | ${susfs_lkm_checkbox} |
            | 🛡️ Baseband Guard | Supported (Full Only) |
            | 🖥️ Droidspaces | Supported (Full Only) |
            | ⚙️ Re-Kernel (Netlink) | ${rekernel_netlink_checkbox}
@@ -943,15 +1114,18 @@ jobs:
            | **FULL** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
            | **CORE** | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
 
+           > **KernelSU-Next-LKM**: SuSFS is NOT built in. Flash the kernel zip, then install \`SuSFS-LKM_*.zip\` as a KernelSU module and reboot. Never combine it with a built-in SuSFS kernel.
+
            ---
 
            ### 💻 KSU Managers in this build
 
-           | Manager | Mode | Version |
-           |:---|:---:|:---|${NOTES_ROWS}
+           | Manager | Mode | Version | Manager APK |
+           |:---|:---:|:---|:---|${NOTES_ROWS}
 
            ---
           " "${ASSETS[@]}"
+
 
 
 
