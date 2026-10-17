@@ -32,14 +32,14 @@ on:
         type: boolean
         default: true
 
-      manager_kernelsu_next_lkm:
-        description: "Build KernelSU-Next + SuSFS LKM (no built-in SuSFS; SuSFS-LKM_*.zip attached to release)"
+      manager_bakasu:
+        description: "Build BakaSU"
         required: true
         type: boolean
         default: true
 
-      manager_bakasu:
-        description: "Build BakaSU"
+      manager_vanilla:
+        description: "Build Vanilla (no KernelSU manager, no SuSFS; DroidSpaces, NoMount, BBG, Re-Kernel Netlink + eBPF always ON; built once, ignores Full/Core)"
         required: true
         type: boolean
         default: true
@@ -70,12 +70,6 @@ on:
         type: string
         default: ""
 
-      susfs_lkm_tag:
-        description: "SuSFS LKM release tag (inforcqb/susfs4ksu-lkm). Leave empty to use the latest release."
-        required: false
-        type: string
-        default: ""
-
       nomount_commit:
         description: "Custom NoMount commit or tag. Leave empty to use the latest commit on master."
         required: false
@@ -97,47 +91,50 @@ on:
 
 jobs:
   Determine_Matrix:
-    name: Determine which managers to build
+    name: Determine which builds to run
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
-      modes: ${{ steps.set-modes.outputs.modes }}
     steps:
-      - name: Build matrix JSON from checked managers
+      - name: Build matrix JSON from checked managers and modes
         id: set-matrix
         run: |
           MANAGERS=()
           [[ "${{ inputs.manager_official_kernelsu }}" == true ]] && MANAGERS+=("Official-KernelSU")
           [[ "${{ inputs.manager_kernelsu_next }}" == true ]] && MANAGERS+=("KernelSU-Next")
-          [[ "${{ inputs.manager_kernelsu_next_lkm }}" == true ]] && MANAGERS+=("KernelSU-Next-LKM")
           [[ "${{ inputs.manager_bakasu }}" == true ]] && MANAGERS+=("BakaSU")
 
-          if [[ ${#MANAGERS[@]} -eq 0 ]]; then
-            echo "::error::No manager checked — tick at least one manager_* checkbox before running this workflow."
+          VANILLA=false
+          [[ "${{ inputs.manager_vanilla }}" == true ]] && VANILLA=true
+
+          if [[ ${#MANAGERS[@]} -eq 0 && "$VANILLA" != true ]]; then
+            echo "::error::Nothing checked — tick at least one manager_* checkbox (or manager_vanilla) before running this workflow."
             exit 1
           fi
 
-          MATRIX_JSON=$(printf '%s\n' "${MANAGERS[@]}" | jq -R . | jq -sc .)
-          echo "==> Managers selected for this run: ${MANAGERS[*]}"
-          echo "matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
-
-      - name: Determine selected build modes
-        id: set-modes
-        run: |
           MODES=()
           [[ "${{ inputs.full_build }}" == true ]] && MODES+=("FULL")
           [[ "${{ inputs.core_build }}" == true ]] && MODES+=("CORE")
 
-          if [[ ${#MODES[@]} -eq 0 ]]; then
-            echo "::error::Neither Full nor Core is ticked — tick at least one build mode before running this workflow."
+          # Modes only matter for the KernelSU managers; Vanilla is built once with all features.
+          if [[ ${#MANAGERS[@]} -gt 0 && ${#MODES[@]} -eq 0 ]]; then
+            echo "::error::Neither Full nor Core is ticked — tick at least one build mode when building a KernelSU manager."
             exit 1
           fi
 
-          MODES_JSON=$(printf '%s\n' "${MODES[@]}" | jq -R . | jq -sc .)
-          echo "==> Build modes selected for this run: ${MODES[*]} (each ticked mode is built for every checked manager)"
-          echo "modes=${MODES_JSON}" >> "$GITHUB_OUTPUT"
+          ENTRIES=()
+          for m in "${MANAGERS[@]}"; do
+            for mode in "${MODES[@]}"; do
+              ENTRIES+=("${m}|${mode}")
+            done
+          done
+          [[ "$VANILLA" == true ]] && ENTRIES+=("Vanilla|ALL")
+
+          MATRIX_JSON=$(printf '%s\n' "${ENTRIES[@]}" | jq -R 'split("|") | {ksu_type: .[0], build_mode: .[1]}' | jq -sc .)
+          echo "==> Builds selected for this run: ${ENTRIES[*]}"
+          echo "matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
 
   Resolve_Toolchain:
     needs: Determine_Matrix
@@ -211,8 +208,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ksu_type: ${{ fromJSON(needs.Determine_Matrix.outputs.matrix) }}
-        build_mode: ${{ fromJSON(needs.Determine_Matrix.outputs.modes) }}
+        include: ${{ fromJSON(needs.Determine_Matrix.outputs.matrix) }}
     env:
         GH_TOKEN: ${{ github.token }}
         SOC: marble
@@ -245,7 +241,8 @@ jobs:
 
       - name: Resolve feature set for this leg
         run: |
-          if [[ "${{ matrix.build_mode }}" == "FULL" ]]; then
+          # Vanilla always gets every feature (except SuSFS); KernelSU legs follow FULL/CORE.
+          if [[ "${{ matrix.ksu_type }}" == "Vanilla" || "${{ matrix.build_mode }}" == "FULL" ]]; then
             SUSFS=true
             NOMOUNT=true
             BBG=true
@@ -260,8 +257,8 @@ jobs:
             REKERNEL_EBPF=true
             DROIDSPACES=false
           fi
-          # SuSFS LKM must never stack with built-in SuSFS
-          [[ "${{ matrix.ksu_type }}" == "KernelSU-Next-LKM" ]] && SUSFS=false
+          # Vanilla has no KernelSU, so SuSFS is never built in
+          [[ "${{ matrix.ksu_type }}" == "Vanilla" ]] && SUSFS=false
           echo "SUSFS=${SUSFS}" >> $GITHUB_ENV
           echo "NOMOUNT=${NOMOUNT}" >> $GITHUB_ENV
           echo "BBG=${BBG}" >> $GITHUB_ENV
@@ -441,19 +438,16 @@ jobs:
 
           case "${{ matrix.ksu_type }}" in
 
-            "None")
+            "Vanilla")
+              # No KernelSU manager at all
               ;;
 
             "Official-KernelSU")
               curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
               ;;
 
-            "KernelSU-Next"|"KernelSU-Next-LKM")
-              if [[ "${{ env.SUSFS }}" == true ]]; then
-                curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
-              else
-                curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s dev
-              fi
+            "KernelSU-Next")
+              curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
               ;;
 
             "BakaSU")
@@ -462,7 +456,7 @@ jobs:
 
           esac
 
-          if [[ "${{ matrix.ksu_type }}" != "None" ]]; then
+          if [[ "${{ matrix.ksu_type }}" != "Vanilla" ]]; then
             KSU_DIRS_AFTER=$(ls -d */ 2>/dev/null | sort || true)
             KSU_DIR=$(comm -13 <(echo "$KSU_DIRS_BEFORE") <(echo "$KSU_DIRS_AFTER") | head -n1 | sed 's:/$::')
 
@@ -485,7 +479,7 @@ jobs:
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --always 2>/dev/null || echo "")
                   [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((30000 + KSU_REV_COUNT))
                   ;;
-                "KernelSU-Next"|"KernelSU-Next-LKM")
+                "KernelSU-Next")
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo "")
                   [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((30000 + KSU_REV_COUNT))
                   ;;
@@ -646,15 +640,6 @@ jobs:
 
           echo "-${KERNEL_NAME}-${{ github.actor }}" > .scmversion
 
-          # susfs-lkm-module picks the .ko from osrelease (needs "5.10.*-android12-*").
-          # CONFIG_LOCALVERSION_AUTO is off on this tree, so .scmversion is ignored -> patch CONFIG_LOCALVERSION.
-          if [[ "${{ matrix.ksu_type }}" == "KernelSU-Next-LKM" ]] && ! grep -q '^CONFIG_LOCALVERSION=".*-android12-' arch/arm64/configs/marble_defconfig; then
-            sed -i 's/^CONFIG_LOCALVERSION="\(.*\)"$/CONFIG_LOCALVERSION="-android12-9\1"/' arch/arm64/configs/marble_defconfig
-            grep -q '^CONFIG_LOCALVERSION="-android12-9' arch/arm64/configs/marble_defconfig \
-              || echo 'CONFIG_LOCALVERSION="-android12-9"' >> arch/arm64/configs/marble_defconfig
-            echo "==> SuSFS LKM: $(grep '^CONFIG_LOCALVERSION=' arch/arm64/configs/marble_defconfig)"
-          fi
-
           echo "CONFIG_TMPFS_XATTR=y" >> arch/arm64/configs/marble_defconfig
 
           echo "CONFIG_BPF_SYSCALL=y" >> arch/arm64/configs/marble_defconfig
@@ -678,16 +663,6 @@ jobs:
 
           echo "ccache status after build:"
           ccache -s
-
-      - name: Verify kernel release (SuSFS LKM KMI)
-        if: ${{ matrix.ksu_type == 'KernelSU-Next-LKM' }}
-        run: |
-          KREL=$(cat ${SOC}/out/include/config/kernel.release)
-          echo "==> kernel.release: ${KREL}"
-          case "$KREL" in
-            5.10.*-android12-*) echo "==> OK: susfs-lkm-module will select android12-5.10" ;;
-            *) echo "::error::kernel.release '${KREL}' does not match 5.10.*-android12-* - SuSFS LKM would refuse to load"; exit 1 ;;
-          esac
 
       - name: Save ccache
         if: ${{ always() && steps.ccache-restore.outputs.cache-hit != 'true' }}
@@ -733,12 +708,15 @@ jobs:
 
       - name: Make AnyKernel3
         run: |
-          ZIP_NAME="${KERNEL_NAME}-${{ matrix.ksu_type }}-${{ matrix.build_mode }}"
+          if [[ "${{ matrix.ksu_type }}" == "Vanilla" ]]; then
+            # Vanilla is built once with every feature, so no FULL/CORE tag in the name
+            ZIP_NAME="${KERNEL_NAME}-Vanilla"
+          else
+            ZIP_NAME="${KERNEL_NAME}-${{ matrix.ksu_type }}-${{ matrix.build_mode }}"
+          fi
 
           if [[ "${{ env.SUSFS }}" == true ]]; then
             ZIP_NAME="${ZIP_NAME}-SuSFS"
-          elif [[ "${{ matrix.ksu_type }}" == "KernelSU-Next-LKM" ]]; then
-            ZIP_NAME="${ZIP_NAME}-SuSFS-LKM"
           fi
 
           if [[ "${{ env.NOMOUNT }}" == true ]]; then
@@ -761,7 +739,7 @@ jobs:
           echo "ZIP_NAME=${ZIP_NAME}.zip" >> $GITHUB_ENV
 
       - name: Fetch ${{ matrix.ksu_type }} manager APK (CI)
-        if: ${{ inputs.include_manager_apk }}
+        if: ${{ inputs.include_manager_apk && matrix.ksu_type != 'Vanilla' }}
         continue-on-error: true
         env:
           PAT: ${{ secrets.RELEASE_PAT }}
@@ -771,7 +749,7 @@ jobs:
           # "<repo> <branch> <workflow file> <artifact name regex>", tried in order
           case "$KSU_TYPE" in
             "Official-KernelSU") CANDS=("tiann/KernelSU main build-manager.yml ^manager$") ;;
-            "KernelSU-Next"|"KernelSU-Next-LKM")
+            "KernelSU-Next")
               CANDS=()
               [[ "${SUSFS}" == true ]] && CANDS+=("pershoot/KernelSU-Next dev-susfs build-manager-ci.yml ^manager$")
               CANDS+=("KernelSU-Next/KernelSU-Next dev build-manager-ci.yml ^manager$") ;;
@@ -869,63 +847,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
-  Build_SuSFS_LKM:
-    needs: Determine_Matrix
-    if: ${{ inputs.manager_kernelsu_next_lkm }}
-    name: Fetch SuSFS LKM module ZIP
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      LKM_REPO: inforcqb/susfs4ksu-lkm
-    steps:
-      - name: Get official susfs_guard_lkm module ZIP (fallback - matsuzaka-yuki wrapper)
-        run: |
-          set -euo pipefail
-          if [[ -n "${{ inputs.susfs_lkm_tag }}" ]]; then
-            REL_JSON=$(gh api "repos/${LKM_REPO}/releases/tags/${{ inputs.susfs_lkm_tag }}")
-          else
-            REL_JSON=$(gh api "repos/${LKM_REPO}/releases/latest")
-          fi
-          TAG=$(jq -r '.tag_name' <<<"$REL_JSON")
-          ASSET=$(jq -r '.assets[].name | select(test("^susfs_guard_lkm-module-.*-arm64\\.zip$"))' <<<"$REL_JSON" | head -n1)
-          echo "==> ${LKM_REPO} release: ${TAG}"
-
-          if [[ -n "$ASSET" ]]; then
-            gh release download "$TAG" -R "$LKM_REPO" -p "$ASSET" -D lkm-dl
-            unzip -Z1 "lkm-dl/${ASSET}" > lkm-list.txt
-            grep -qx 'lib/susfs_guard_lkm-android12-5.10.ko' lkm-list.txt \
-              || { echo "::error::${ASSET} has no android12-5.10 .ko"; exit 1; }
-            OUT="SuSFS-LKM_${TAG}.zip"
-            cp "lkm-dl/${ASSET}" "$OUT"
-            echo "==> Using official upstream module ${ASSET}"
-          else
-            echo "::warning::${TAG} has no official module ZIP - falling back to matsuzaka-yuki/susfs-lkm-module (pinned upstream build)."
-            git clone --depth=1 https://github.com/matsuzaka-yuki/susfs-lkm-module.git lkm
-            export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
-            if [[ -z "$ANDROID_NDK_HOME" || ! -d "$ANDROID_NDK_HOME" ]]; then
-              wget -q https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
-              unzip -q android-ndk-r27d-linux.zip -d "$HOME"
-              export ANDROID_NDK_HOME="$HOME/android-ndk-r27d"
-            fi
-            (cd lkm && python3 tools/build.py)
-            WRAP_TAG=$(sed -n 's/^TAG = "\(.*\)"$/\1/p' lkm/tools/build.py)
-            OUT="SuSFS-LKM_${WRAP_TAG}_wrapper-$(git -C lkm rev-parse --short HEAD).zip"
-            cp lkm/dist/*.zip "$OUT"
-          fi
-          echo "==> Built ${OUT}"
-          unzip -l "$OUT"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: build-susfs-lkm
-          path: SuSFS-LKM_*.zip
-          retention-days: 1
-
   Create_Release:
     name: Create combined GitHub Release
-    needs: [Build_Kernel_Marble, Build_SuSFS_LKM]
+    needs: [Build_Kernel_Marble]
 
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -1004,7 +928,9 @@ jobs:
               ROW_APK["$KSU_TYPE"]="\`${MANAGER_APK}\` ([CI $(jq -r '.manager_apk_match' "$META")@$(jq -r '.manager_apk_sha' "$META")]($(jq -r '.manager_apk_url' "$META")))"
             fi
 
-            if [[ -n "$KSU_MANAGER_COMMIT" ]]; then
+            if [[ "$KSU_TYPE" == "Vanilla" ]]; then
+              ksu_row_version="—"
+            elif [[ -n "$KSU_MANAGER_COMMIT" ]]; then
               ksu_row_version="${KSU_MANAGER_VERSION}@[${KSU_MANAGER_COMMIT}](${KSU_MANAGER_COMMIT_URL})"
             else
               ksu_row_version="${KSU_MANAGER_VERSION}"
@@ -1039,17 +965,10 @@ jobs:
             exit 1
           fi
 
-          SUSFS_LKM_ZIP=$(find . -type f -name 'SuSFS-LKM_*.zip' | head -n1)
-          if [[ -n "$SUSFS_LKM_ZIP" ]]; then
-            ASSETS+=("$SUSFS_LKM_ZIP")
-            susfs_lkm_checkbox="Supported ($(basename "$SUSFS_LKM_ZIP"), for KernelSU-Next-LKM zip only)"
-          else
-            susfs_lkm_checkbox="Not built"
-          fi
-
           MODES_SELECTED=()
           [[ "${{ inputs.full_build }}" == true ]] && MODES_SELECTED+=("FULL")
           [[ "${{ inputs.core_build }}" == true ]] && MODES_SELECTED+=("CORE")
+          [[ "${{ inputs.manager_vanilla }}" == true ]] && MODES_SELECTED+=("VANILLA")
           MODES_LABEL=""
           for m in "${MODES_SELECTED[@]}"; do
             if [[ -z "$MODES_LABEL" ]]; then
@@ -1059,7 +978,9 @@ jobs:
             fi
           done
 
-          if [[ -n "$SUSFS_VERSION_TAG" && "$SUSFS_VERSION_TAG" != "unknown" && "$SUSFS_VERSION_TAG" != "null" ]]; then
+          if [[ -z "${SUSFS_COMMIT:-}" ]]; then
+            susfs_checkbox="Not included (Vanilla only)"
+          elif [[ -n "${SUSFS_VERSION_TAG:-}" && "$SUSFS_VERSION_TAG" != "unknown" && "$SUSFS_VERSION_TAG" != "null" ]]; then
             susfs_checkbox="Supported (susfs4ksu ${SUSFS_VERSION_TAG}@[${SUSFS_COMMIT}](${SUSFS_COMMIT_URL}))"
           else
             susfs_checkbox="Supported (susfs4ksu@[${SUSFS_COMMIT}](${SUSFS_COMMIT_URL}))"
@@ -1094,9 +1015,8 @@ jobs:
            | 📦 Source | ${{ inputs.kernel_source }} |
            | 🔗 Kernel branch | ${{ inputs.kernel_branch }}@[${KERNEL_COMMIT}](${KERNEL_COMMIT_URL})
            | ⚙️ SuSFS Version | ${susfs_checkbox}
-           | 🧩 SuSFS LKM | ${susfs_lkm_checkbox} |
-           | 🛡️ Baseband Guard | Supported (Full Only) |
-           | 🖥️ Droidspaces | Supported (Full Only) |
+           | 🛡️ Baseband Guard | Supported (Full & Vanilla only) |
+           | 🖥️ Droidspaces | Supported (Full & Vanilla only) |
            | ⚙️ Re-Kernel (Netlink) | ${rekernel_netlink_checkbox}
            | ⚙️ Re-Kernel (eBPF) | ${rekernel_ebpf_checkbox}
            | 🗂️ NoMount | ${nomount_checkbox}
@@ -1105,16 +1025,17 @@ jobs:
 
            ---
 
-           ### 🧬 Full vs Core
+           ### 🧬 Full vs Core vs Vanilla
 
-           SuSFS, NoMount, and Re-Kernel (Netlink+eBPF) are enabled in all zip packages in this release. BBG and DroidSpaces are only available in the FULL build — check the 'Mode' column in the manager table below to see which zip is FULL or CORE.
+           NoMount and Re-Kernel (Netlink+eBPF) are enabled in all zip packages in this release. SuSFS is enabled in every KernelSU zip. BBG and DroidSpaces are only available in the FULL and VANILLA builds — check the 'Mode' column in the manager table below to see which zip is FULL, CORE or VANILLA.
            
            | Mode | SuSFS | NoMount | BBG | Re-Kernel Netlink | Re-Kernel eBPF | DroidSpaces |
            |:---|:---:|:---:|:---:|:---:|:---:|:---:|
            | **FULL** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
            | **CORE** | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
+           | **VANILLA** | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-           > **KernelSU-Next-LKM**: SuSFS is NOT built in. Flash the kernel zip, then install \`SuSFS-LKM_*.zip\` as a KernelSU module and reboot. Never combine it with a built-in SuSFS kernel.
+           > **Vanilla**: no KernelSU manager and no SuSFS built in. Every other feature is on. Built once per run (ignores Full/Core).
 
            ---
 
@@ -1125,10 +1046,4 @@ jobs:
 
            ---
           " "${ASSETS[@]}"
-
-
-
-
-
-
           
