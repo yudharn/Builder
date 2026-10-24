@@ -451,7 +451,7 @@ jobs:
               ;;
 
             "BakaSU")
-              curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/sync-susfs/kernel/setup.sh" | bash -s sync-susfs
+              curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
               ;;
 
           esac
@@ -482,6 +482,11 @@ jobs:
                 "KernelSU-Next")
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo "")
                   [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((30000 + KSU_REV_COUNT))
+                  ;;
+                "BakaSU")
+                  # mirrors kernel/Kbuild: KSU_VERSION = 30000 + rev-count + 700
+                  KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo "")
+                  [[ -n "$KSU_REV_COUNT" ]] && KSU_CODE=$((30000 + KSU_REV_COUNT + 700))
                   ;;
                 *)
                   KSU_TAG=$(cd "$KSU_DIR" && git describe --tags --always 2>/dev/null || echo "")
@@ -538,42 +543,6 @@ jobs:
 
             cd ..
             patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch
-
-            # susfs's fs/exec.c hooks call ksu_setup_preinit_file / ksu_preinit_handle_post_execveat,
-            # which only KernelSU-Next defines. Stub them for managers that don't (BakaSU, Official).
-            if ! grep -rqs "ksu_setup_preinit_file" "${KSU_DIR}/"; then
-              echo "==> ${{ matrix.ksu_type }} has no preinit symbols - adding fs/ksu_preinit_stub.c"
-              cat > fs/ksu_preinit_stub.c <<'EOF'
-          #include <linux/types.h>
-          #include <linux/errno.h>
-          #include <linux/export.h>
-          struct filename;
-          struct user_arg_ptr;
-          int ksu_setup_preinit_file(struct filename **filename_ptr, struct user_arg_ptr *argv_user)
-          {
-          	return -EINVAL;
-          }
-          int ksu_preinit_handle_post_execveat(int *fd, struct filename **filename_ptr,
-          		void *argv_user, void *envp_user,
-          		int *flags, int *retval, int *preinit_fd)
-          {
-          	return 0;
-          }
-          EOF
-              echo 'obj-$(CONFIG_KSU_SUSFS) += ksu_preinit_stub.o' >> fs/Makefile
-            fi
-
-            # The patch's selinux_hide hooks call my_setprocattr/my_write_context/my_write_access, which only
-            # KernelSU-Next exports. BakaSU/Official don't, so route those hooks to the stock selinux functions.
-            if ! grep -rqE "^(ssize_t|int) (__nocfi )?my_(write_context|setprocattr)" "${KSU_DIR}/"; then
-              echo "==> ${{ matrix.ksu_type }} does not export my_* selinux_hide handlers - routing hooks to stock selinux code"
-              sed -i 's/return my_setprocattr(name, value, size);/return selinux_setprocattr(name, value, size);/' security/selinux/hooks.c
-              sed -i -e 's/return my_write_context(file, buf, size);/return sel_write_context(file, buf, size);/' \
-                     -e 's/return my_write_access(file, buf, size);/return sel_write_access(file, buf, size);/' security/selinux/selinuxfs.c
-              if grep -qE "return my_(setprocattr|write_context|write_access)\(" security/selinux/hooks.c security/selinux/selinuxfs.c; then
-                echo "::error::selinux_hide hook rewrite did not apply"; exit 1
-              fi
-            fi
 
             echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/marble_defconfig
@@ -789,7 +758,7 @@ jobs:
               CANDS=()
               [[ "${SUSFS}" == true ]] && CANDS+=("pershoot/KernelSU-Next dev-susfs build-manager-ci.yml ^manager$")
               CANDS+=("KernelSU-Next/KernelSU-Next dev build-manager-ci.yml ^manager$") ;;
-            "BakaSU") CANDS=("Baka-SU/BakaSU sync-susfs build-manager.yml ^Manager-release$") ;;
+            "BakaSU") CANDS=("Baka-SU/BakaSU main build-manager.yml ^Manager-release$") ;;
             *) echo "==> No manager CI known for ${KSU_TYPE}"; exit 0 ;;
           esac
 
