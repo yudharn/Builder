@@ -773,14 +773,17 @@ jobs:
           export PATH="${GITHUB_WORKSPACE}/toolchains/llvm-toolchain/bin:$PATH"
           KOUT="${GITHUB_WORKSPACE}/${SOC}/out"
           [[ -f "${KOUT}/Module.symvers" ]] || cp "${KOUT}/vmlinux.symvers" "${KOUT}/Module.symvers"
+          # Image-only build skips scripts/module.lds, which linking any external .ko needs
+          make -C "${SOC}" O="${KOUT}" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare
           # Built against this exact tree/.config: the prebuilt android12-5.10 .ko (GKI DDK headers) panics on Melt.
           make -C "${SOC}" O="${KOUT}" M="${GITHUB_WORKSPACE}/lkm-src/kernel" \
             ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
           cp lkm-src/kernel/susfs_guard_lkm.ko lkm-out/susfs_guard_lkm-android12-5.10.ko
 
           OUT="SuSFS-LKM_marble-${KERNEL_BASE_VERSION}-${TAG}-${KERNEL_COMMIT}.zip"
+          # Only the 4 args every tagged pack_module.py accepts (--sha/--run-id exist on main only)
           python3 lkm-src/tools/pack_module.py --ko-dir lkm-out --insmod lkm-out/susfs_insmod \
-            --tag "${TAG}-marble" --sha "$(git -C lkm-src rev-parse HEAD)" --out "$OUT"
+            --tag "${TAG}-marble" --out "$OUT"
           {
             echo "SUSFS_LKM_ZIP=${OUT}"
             echo "SUSFS_LKM_TAG=${TAG}"
@@ -1063,8 +1066,10 @@ jobs:
 
           if [[ -n "${SUSFS_LKM_ZIP:-}" ]]; then
             susfs_lkm_checkbox="Vanilla: \`${SUSFS_LKM_ZIP}\` ([${SUSFS_LKM_TAG}](${SUSFS_LKM_URL}))"
+            vanilla_susfs_cell="🧱 LKM"
           else
-            susfs_lkm_checkbox="—"
+            susfs_lkm_checkbox="— (LKM build failed or Vanilla not built)"
+            vanilla_susfs_cell="❌"
           fi
 
           BUILD_TIME=$(date -u +"%Y%m%d_%H%M")
@@ -1102,7 +1107,7 @@ jobs:
            |:---|:---:|:---:|:---:|:---:|:---:|:---:|
            | **FULL** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
            | **CORE** | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
-           | **VANILLA** | 🧱 LKM | ✅ | ✅ | ✅ | ✅ | ✅ |
+           | **VANILLA** | ${vanilla_susfs_cell} | ✅ | ✅ | ✅ | ✅ | ✅ |
 
            > **Vanilla**: no KernelSU manager and no SuSFS built in. Every other feature is on. Built once per run (ignores Full/Core). Install root yourself (e.g. KernelSU LKM mode), then flash \`SuSFS-LKM_*.zip\` from this release (built against this exact kernel) as a KernelSU module and reboot. Never use the LKM zip on FULL/CORE.
 
