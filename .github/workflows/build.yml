@@ -678,6 +678,9 @@ jobs:
           echo "CONFIG_DEBUG_INFO_BTF_MODULES=y" >> arch/arm64/configs/marble_defconfig
 
           if [[ "${{ matrix.ksu_type }}" == "Vanilla" ]]; then
+            # SuSFS LKM picks its .ko from osrelease: needs "5.10.x-android12-..." (tag-less 5.10 is ambiguous and refused)
+            sed -i '/^CONFIG_LOCALVERSION=/d' arch/arm64/configs/marble_defconfig
+            echo "CONFIG_LOCALVERSION=\"-android12-9-${KERNEL_NAME}\"" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_MODULES=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KALLSYMS=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KALLSYMS_ALL=y" >> arch/arm64/configs/marble_defconfig
