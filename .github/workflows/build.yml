@@ -39,10 +39,25 @@ on:
         default: true
 
       manager_vanilla:
-        description: "Build Vanilla (no KernelSU manager, no SuSFS; DroidSpaces, NoMount, BBG, Re-Kernel Netlink + eBPF always ON; built once, ignores Full/Core)"
+        description: "Build Vanilla (no KernelSU manager, no built-in SuSFS — SuSFS LKM zip attached; DroidSpaces, NoMount, BBG, Re-Kernel Netlink + eBPF always ON; built once, ignores Full/Core)"
         required: true
         type: boolean
         default: true
+
+      susfs_lkm_source:
+        description: "SuSFS LKM module source (Vanilla only)"
+        required: true
+        type: choice
+        default: inforcqb
+        options:
+          - inforcqb
+          - matsuzaka-yuki
+
+      susfs_lkm_tag:
+        description: "SuSFS LKM release tag. Leave empty for latest release."
+        required: false
+        type: string
+        default: ""
 
       custom_name:
         description: "kernel"
@@ -662,9 +677,21 @@ jobs:
           echo "CONFIG_DEBUG_INFO_BTF=y" >> arch/arm64/configs/marble_defconfig
           echo "CONFIG_DEBUG_INFO_BTF_MODULES=y" >> arch/arm64/configs/marble_defconfig
 
+          if [[ "${{ matrix.ksu_type }}" == "Vanilla" ]]; then
+            echo "CONFIG_MODULES=y" >> arch/arm64/configs/marble_defconfig
+            echo "CONFIG_KALLSYMS=y" >> arch/arm64/configs/marble_defconfig
+            echo "CONFIG_KALLSYMS_ALL=y" >> arch/arm64/configs/marble_defconfig
+          fi
+
           make O=out marble_defconfig
 
           make -j$(nproc) O=out CC="ccache ${CLANG_ROOT}/clang" HOSTCC="ccache ${CLANG_ROOT}/clang" Image
+
+          if [[ "${{ matrix.ksu_type }}" == "Vanilla" ]]; then
+            KREL=$(cat out/include/config/kernel.release 2>/dev/null || echo "")
+            echo "==> Vanilla kernel release: ${KREL}"
+            [[ "$KREL" == 5.10.*android12-* ]] || echo "::warning::kernel release '${KREL}' lacks 'android12-' — SuSFS LKM loader selects .ko by osrelease and will refuse to load."
+          fi
 
           echo "ccache status after build:"
           ccache -s
@@ -742,6 +769,31 @@ jobs:
           zip -r9 ../"${ZIP_NAME}.zip" * -x .git
 
           echo "ZIP_NAME=${ZIP_NAME}.zip" >> $GITHUB_ENV
+
+      - name: Fetch SuSFS LKM module (Vanilla)
+        if: ${{ matrix.ksu_type == 'Vanilla' }}
+        run: |
+          set -euo pipefail
+          case "${{ inputs.susfs_lkm_source }}" in
+            inforcqb)       REPO=inforcqb/susfs4ksu-lkm;          PAT='*module*arm64*.zip' ;;
+            matsuzaka-yuki) REPO=matsuzaka-yuki/susfs-lkm-module; PAT='*.zip' ;;
+          esac
+          TAG="${{ inputs.susfs_lkm_tag }}"
+          [[ -z "$TAG" ]] && TAG=$(gh release view -R "$REPO" --json tagName -q .tagName)
+
+          rm -rf lkm-dl && mkdir lkm-dl
+          gh release download "$TAG" -R "$REPO" -p "$PAT" -D lkm-dl
+          SRC=$(find lkm-dl -name '*.zip' | sort | head -n1)
+          [[ -n "$SRC" ]] || { echo "::error::No module zip matching ${PAT} in ${REPO}@${TAG}"; exit 1; }
+
+          OUT="SuSFS-LKM_$(basename "$SRC")"
+          cp "$SRC" "$OUT"
+          {
+            echo "SUSFS_LKM_ZIP=${OUT}"
+            echo "SUSFS_LKM_TAG=${TAG}"
+            echo "SUSFS_LKM_URL=https://github.com/${REPO}/releases/tag/${TAG}"
+          } >> "$GITHUB_ENV"
+          echo "==> ${OUT} <- ${REPO}@${TAG}"
 
       - name: Fetch ${{ matrix.ksu_type }} manager APK (CI)
         if: ${{ inputs.include_manager_apk && matrix.ksu_type != 'Vanilla' }}
@@ -838,7 +890,10 @@ jobs:
             --arg manager_apk_url "${MANAGER_APK_URL:-}" \
             --arg manager_apk_match "${MANAGER_APK_MATCH:-}" \
             --arg manager_apk_sha "${MANAGER_APK_SHA:-}" \
-            '{manager_apk:$manager_apk,manager_apk_url:$manager_apk_url,manager_apk_match:$manager_apk_match,manager_apk_sha:$manager_apk_sha,ksu_type:$ksu_type,build_mode:$build_mode,kernel_name:$kernel_name,zip_name:$zip_name,ksu_manager_version:$ksu_manager_version,ksu_manager_commit:$ksu_manager_commit,ksu_manager_commit_url:$ksu_manager_commit_url,kernel_commit:$kernel_commit,kernel_commit_url:$kernel_commit_url,kernel_base_version:$kernel_base_version,clang_version:$clang_version,susfs_commit:$susfs_commit,susfs_commit_url:$susfs_commit_url,susfs_version_tag:$susfs_version_tag,nomount_commit:$nomount_commit,nomount_commit_url:$nomount_commit_url,nomount_version_tag:$nomount_version_tag}' \
+            --arg susfs_lkm_zip "${SUSFS_LKM_ZIP:-}" \
+            --arg susfs_lkm_tag "${SUSFS_LKM_TAG:-}" \
+            --arg susfs_lkm_url "${SUSFS_LKM_URL:-}" \
+            '{susfs_lkm_zip:$susfs_lkm_zip,susfs_lkm_tag:$susfs_lkm_tag,susfs_lkm_url:$susfs_lkm_url,manager_apk:$manager_apk,manager_apk_url:$manager_apk_url,manager_apk_match:$manager_apk_match,manager_apk_sha:$manager_apk_sha,ksu_type:$ksu_type,build_mode:$build_mode,kernel_name:$kernel_name,zip_name:$zip_name,ksu_manager_version:$ksu_manager_version,ksu_manager_commit:$ksu_manager_commit,ksu_manager_commit_url:$ksu_manager_commit_url,kernel_commit:$kernel_commit,kernel_commit_url:$kernel_commit_url,kernel_base_version:$kernel_base_version,clang_version:$clang_version,susfs_commit:$susfs_commit,susfs_commit_url:$susfs_commit_url,susfs_version_tag:$susfs_version_tag,nomount_commit:$nomount_commit,nomount_commit_url:$nomount_commit_url,nomount_version_tag:$nomount_version_tag}' \
             > "${GITHUB_WORKSPACE}/metadata.json"
 
       - name: Upload build artifact
@@ -849,6 +904,7 @@ jobs:
             ${{ env.ZIP_NAME }}
             metadata.json
             *_Manager_*.apk
+            SuSFS-LKM_*.zip
           if-no-files-found: ignore
           retention-days: 1
 
@@ -927,6 +983,14 @@ jobs:
 
             ASSETS+=("${dir}${ZIP_NAME}")
 
+            LKM_ZIP=$(jq -r '.susfs_lkm_zip // ""' "$META")
+            if [[ -n "$LKM_ZIP" && -f "${dir}${LKM_ZIP}" && -z "${SUSFS_LKM_ZIP:-}" ]]; then
+              SUSFS_LKM_ZIP="$LKM_ZIP"
+              SUSFS_LKM_TAG=$(jq -r '.susfs_lkm_tag' "$META")
+              SUSFS_LKM_URL=$(jq -r '.susfs_lkm_url' "$META")
+              ASSETS+=("${dir}${LKM_ZIP}")
+            fi
+
             MANAGER_APK=$(jq -r '.manager_apk // ""' "$META")
             if [[ -n "$MANAGER_APK" && -f "${dir}${MANAGER_APK}" && -z "${ROW_APK[$KSU_TYPE]+x}" ]]; then
               ASSETS+=("${dir}${MANAGER_APK}")
@@ -1004,6 +1068,12 @@ jobs:
             nomount_checkbox="Supported"
           fi
 
+          if [[ -n "${SUSFS_LKM_ZIP:-}" ]]; then
+            susfs_lkm_checkbox="Vanilla: \`${SUSFS_LKM_ZIP}\` ([${SUSFS_LKM_TAG}](${SUSFS_LKM_URL}))"
+          else
+            susfs_lkm_checkbox="—"
+          fi
+
           BUILD_TIME=$(date -u +"%Y%m%d_%H%M")
           REL_NAME="${KERNEL_BASE_VERSION}-${KERNEL_NAME}-${BUILD_TIME}"
 
@@ -1020,6 +1090,7 @@ jobs:
            | 📦 Source | ${{ inputs.kernel_source }} |
            | 🔗 Kernel branch | ${{ inputs.kernel_branch }}@[${KERNEL_COMMIT}](${KERNEL_COMMIT_URL})
            | ⚙️ SuSFS Version | ${susfs_checkbox}
+           | 🧱 SuSFS LKM | ${susfs_lkm_checkbox} |
            | 🛡️ Baseband Guard | Supported (Full & Vanilla only) |
            | 🖥️ Droidspaces | Supported (Full & Vanilla only) |
            | ⚙️ Re-Kernel (Netlink) | ${rekernel_netlink_checkbox}
@@ -1038,9 +1109,9 @@ jobs:
            |:---|:---:|:---:|:---:|:---:|:---:|:---:|
            | **FULL** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
            | **CORE** | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
-           | **VANILLA** | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+           | **VANILLA** | 🧱 LKM | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-           > **Vanilla**: no KernelSU manager and no SuSFS built in. Every other feature is on. Built once per run (ignores Full/Core).
+           > **Vanilla**: no KernelSU manager and no SuSFS built in. Every other feature is on. Built once per run (ignores Full/Core). Install root yourself (e.g. KernelSU LKM mode), then flash \`SuSFS-LKM_*.zip\` from this release as a KernelSU module and reboot. Never use the LKM zip on FULL/CORE.
 
            ---
 
@@ -1051,5 +1122,6 @@ jobs:
 
            ---
           " "${ASSETS[@]}"
+
 
           
