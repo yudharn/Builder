@@ -44,17 +44,9 @@ on:
         type: boolean
         default: true
 
-      susfs_lkm_source:
-        description: "SuSFS LKM module source (Vanilla only)"
-        required: true
-        type: choice
-        default: inforcqb
-        options:
-          - inforcqb
-          - matsuzaka-yuki
 
       susfs_lkm_tag:
-        description: "SuSFS LKM release tag. Leave empty for latest release."
+        description: "inforcqb/susfs4ksu-lkm tag to build the SuSFS LKM from (against this kernel). Leave empty for latest release."
         required: false
         type: string
         default: ""
@@ -678,9 +670,6 @@ jobs:
           echo "CONFIG_DEBUG_INFO_BTF_MODULES=y" >> arch/arm64/configs/marble_defconfig
 
           if [[ "${{ matrix.ksu_type }}" == "Vanilla" ]]; then
-            # SuSFS LKM picks its .ko from osrelease: needs "5.10.x-android12-..." (tag-less 5.10 is ambiguous and refused)
-            sed -i '/^CONFIG_LOCALVERSION=/d' arch/arm64/configs/marble_defconfig
-            echo "CONFIG_LOCALVERSION=\"-android12-9-${KERNEL_NAME}\"" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_MODULES=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KALLSYMS=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KALLSYMS_ALL=y" >> arch/arm64/configs/marble_defconfig
@@ -690,11 +679,6 @@ jobs:
 
           make -j$(nproc) O=out CC="ccache ${CLANG_ROOT}/clang" HOSTCC="ccache ${CLANG_ROOT}/clang" Image
 
-          if [[ "${{ matrix.ksu_type }}" == "Vanilla" ]]; then
-            KREL=$(cat out/include/config/kernel.release 2>/dev/null || echo "")
-            echo "==> Vanilla kernel release: ${KREL}"
-            [[ "$KREL" == 5.10.*android12-* ]] || echo "::warning::kernel release '${KREL}' lacks 'android12-' — SuSFS LKM loader selects .ko by osrelease and will refuse to load."
-          fi
 
           echo "ccache status after build:"
           ccache -s
@@ -773,30 +757,36 @@ jobs:
 
           echo "ZIP_NAME=${ZIP_NAME}.zip" >> $GITHUB_ENV
 
-      - name: Fetch SuSFS LKM module (Vanilla)
+      - name: Build SuSFS LKM against this kernel (Vanilla)
         if: ${{ matrix.ksu_type == 'Vanilla' }}
+        continue-on-error: true
         run: |
           set -euo pipefail
-          case "${{ inputs.susfs_lkm_source }}" in
-            inforcqb)       REPO=inforcqb/susfs4ksu-lkm;          PAT='*module*arm64*.zip' ;;
-            matsuzaka-yuki) REPO=matsuzaka-yuki/susfs-lkm-module; PAT='*.zip' ;;
-          esac
+          REPO=inforcqb/susfs4ksu-lkm
           TAG="${{ inputs.susfs_lkm_tag }}"
           [[ -z "$TAG" ]] && TAG=$(gh release view -R "$REPO" --json tagName -q .tagName)
 
-          rm -rf lkm-dl && mkdir lkm-dl
-          gh release download "$TAG" -R "$REPO" -p "$PAT" -D lkm-dl
-          SRC=$(find lkm-dl -name '*.zip' | sort | head -n1)
-          [[ -n "$SRC" ]] || { echo "::error::No module zip matching ${PAT} in ${REPO}@${TAG}"; exit 1; }
+          rm -rf lkm-src lkm-out && mkdir -p lkm-out
+          git clone --depth=1 -b "$TAG" "https://github.com/${REPO}.git" lkm-src
+          gh release download "$TAG" -R "$REPO" -p susfs_insmod -D lkm-out
 
-          OUT="SuSFS-LKM_$(basename "$SRC")"
-          cp "$SRC" "$OUT"
+          export PATH="${GITHUB_WORKSPACE}/toolchains/llvm-toolchain/bin:$PATH"
+          KOUT="${GITHUB_WORKSPACE}/${SOC}/out"
+          [[ -f "${KOUT}/Module.symvers" ]] || cp "${KOUT}/vmlinux.symvers" "${KOUT}/Module.symvers"
+          # Built against this exact tree/.config: the prebuilt android12-5.10 .ko (GKI DDK headers) panics on Melt.
+          make -C "${SOC}" O="${KOUT}" M="${GITHUB_WORKSPACE}/lkm-src/kernel" \
+            ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
+          cp lkm-src/kernel/susfs_guard_lkm.ko lkm-out/susfs_guard_lkm-android12-5.10.ko
+
+          OUT="SuSFS-LKM_marble-${KERNEL_BASE_VERSION}-${TAG}-${KERNEL_COMMIT}.zip"
+          python3 lkm-src/tools/pack_module.py --ko-dir lkm-out --insmod lkm-out/susfs_insmod \
+            --tag "${TAG}-marble" --sha "$(git -C lkm-src rev-parse HEAD)" --out "$OUT"
           {
             echo "SUSFS_LKM_ZIP=${OUT}"
             echo "SUSFS_LKM_TAG=${TAG}"
-            echo "SUSFS_LKM_URL=https://github.com/${REPO}/releases/tag/${TAG}"
+            echo "SUSFS_LKM_URL=https://github.com/${REPO}/tree/${TAG}"
           } >> "$GITHUB_ENV"
-          echo "==> ${OUT} <- ${REPO}@${TAG}"
+          echo "==> ${OUT} (built from ${REPO}@${TAG} against ${SOC}@${KERNEL_COMMIT})"
 
       - name: Fetch ${{ matrix.ksu_type }} manager APK (CI)
         if: ${{ inputs.include_manager_apk && matrix.ksu_type != 'Vanilla' }}
@@ -1114,7 +1104,7 @@ jobs:
            | **CORE** | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
            | **VANILLA** | 🧱 LKM | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-           > **Vanilla**: no KernelSU manager and no SuSFS built in. Every other feature is on. Built once per run (ignores Full/Core). Install root yourself (e.g. KernelSU LKM mode), then flash \`SuSFS-LKM_*.zip\` from this release as a KernelSU module and reboot. Never use the LKM zip on FULL/CORE.
+           > **Vanilla**: no KernelSU manager and no SuSFS built in. Every other feature is on. Built once per run (ignores Full/Core). Install root yourself (e.g. KernelSU LKM mode), then flash \`SuSFS-LKM_*.zip\` from this release (built against this exact kernel) as a KernelSU module and reboot. Never use the LKM zip on FULL/CORE.
 
            ---
 
