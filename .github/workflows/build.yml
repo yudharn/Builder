@@ -561,6 +561,21 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y" >> arch/arm64/configs/marble_defconfig
+
+            # Some KernelSU trees (e.g. BakaSU) do not ship the Kconfig symbol for the priority UID filter
+            # (upstream only adds it via 10_enable_susfs_for_ksu.patch). Without the symbol the =y above is ignored
+            # and the feature stays off. Add the symbol ourselves when it is missing. Idempotent.
+            if ! grep -rqs --include='Kconfig*' --exclude-dir=.git --exclude-dir=out 'config KSU_SUSFS_PRIORITY_UID_FILTER' .; then
+              KCONF=$(grep -rls --include='Kconfig*' --exclude-dir=.git --exclude-dir=out 'config KSU_SUSFS_SUS_MAP' . | head -n1)
+              if [[ -n "$KCONF" ]]; then
+                printf '\nconfig KSU_SUSFS_PRIORITY_UID_FILTER\n\tbool "Hide selected app UIDs from priority syscalls"\n\tdepends on KSU_SUSFS\n\tdefault y\n' >> "$KCONF"
+                echo "==> SUSFS: added missing KSU_SUSFS_PRIORITY_UID_FILTER symbol to ${KCONF}"
+              else
+                echo "::warning::SUSFS: could not find the KSU_SUSFS Kconfig, PRIORITY_UID_FILTER symbol not added"
+              fi
+            else
+              echo "==> SUSFS: KSU_SUSFS_PRIORITY_UID_FILTER symbol already defined by this tree"
+            fi
           fi
 
           if [[ "${{ env.NOMOUNT }}" == true ]]; then
@@ -677,6 +692,14 @@ jobs:
           fi
 
           make O=out marble_defconfig
+
+          if [[ "${{ env.SUSFS }}" == true ]]; then
+            if grep -q '^CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y' out/.config; then
+              echo "==> SUSFS: PRIORITY_UID_FILTER is ON in out/.config"
+            else
+              echo "::warning::SUSFS: PRIORITY_UID_FILTER is NOT enabled in out/.config"
+            fi
+          fi
 
           make -j$(nproc) O=out KCFLAGS="-Wno-error=unused-function" CC="ccache ${CLANG_ROOT}/clang" HOSTCC="ccache ${CLANG_ROOT}/clang" Image
 
