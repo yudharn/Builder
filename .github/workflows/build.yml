@@ -551,6 +551,23 @@ jobs:
             cd ..
             patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch
 
+            # Official KernelSU ships no SUSFS Kconfig/hooks of its own (SUSFS would be silently compiled out).
+            # Try the KernelSU-side patch from the susfs repo; dry-run first (and -F0, no fuzz) so a mismatch never half-patches or misplaces hunks.
+            if [[ "${{ matrix.ksu_type }}" == "Official-KernelSU" ]]; then
+              KSU_SUSFS_PATCH="$PWD/susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+              if [[ -f "$KSU_SUSFS_PATCH" && -n "${KSU_DIR:-}" && -d "${KSU_DIR}" ]]; then
+                if (cd "${KSU_DIR}" && patch -p1 -F0 --batch --dry-run < "$KSU_SUSFS_PATCH" > /tmp/ksu_susfs_dryrun.log 2>&1); then
+                  (cd "${KSU_DIR}" && patch -p1 -F0 --batch < "$KSU_SUSFS_PATCH")
+                  echo "==> SUSFS: applied 10_enable_susfs_for_ksu.patch to ${KSU_DIR}"
+                else
+                  echo "::warning::SUSFS: 10_enable_susfs_for_ksu.patch does not apply cleanly to ${KSU_DIR}; this Official-KernelSU build has no SUSFS"
+                  cat /tmp/ksu_susfs_dryrun.log
+                fi
+              else
+                echo "::warning::SUSFS: KernelSU-side patch or source dir not found; this Official-KernelSU build has no SUSFS"
+              fi
+            fi
+
             echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> arch/arm64/configs/marble_defconfig
