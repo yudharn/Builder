@@ -560,6 +560,7 @@ jobs:
             echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> arch/arm64/configs/marble_defconfig
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> arch/arm64/configs/marble_defconfig
+            echo "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y" >> arch/arm64/configs/marble_defconfig
           fi
 
           if [[ "${{ env.NOMOUNT }}" == true ]]; then
