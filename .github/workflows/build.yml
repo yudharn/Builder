@@ -78,6 +78,12 @@ on:
         type: string
         default: ""
 
+      official_ksu_commit:
+        description: "Official-KernelSU (tiann/KernelSU) commit to build. Default 28db74f6 = last commit the SUSFS KernelSU patch is known to apply to. Type main (or latest, or leave empty) for the newest commit."
+        required: false
+        type: string
+        default: "28db74f6"
+
       nomount_commit:
         description: "Custom NoMount commit or tag. Leave empty to use the latest commit on master."
         required: false
@@ -452,6 +458,18 @@ jobs:
 
             "Official-KernelSU")
               curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+
+              # Pin Official-KernelSU to a commit (input official_ksu_commit); empty / main / latest = newest.
+              OFFICIAL_KSU_REF="${{ inputs.official_ksu_commit }}"
+              if [[ -n "$OFFICIAL_KSU_REF" && "$OFFICIAL_KSU_REF" != "main" && "$OFFICIAL_KSU_REF" != "latest" ]]; then
+                OFFICIAL_DIR=$(comm -13 <(echo "$KSU_DIRS_BEFORE") <(ls -d */ 2>/dev/null | sort) | head -n1 | sed 's:/$::')
+                if [[ -n "$OFFICIAL_DIR" && -d "${OFFICIAL_DIR}/.git" ]] && (cd "$OFFICIAL_DIR" && git checkout --quiet "$OFFICIAL_KSU_REF"); then
+                  echo "==> Official-KernelSU: pinned to commit ${OFFICIAL_KSU_REF} (input official_ksu_commit)"
+                else
+                  echo "::error::Official-KernelSU: could not check out commit '${OFFICIAL_KSU_REF}'. Fix the official_ksu_commit input, or use main for the newest commit."
+                  exit 1
+                fi
+              fi
               ;;
 
             "KernelSU-Next")
