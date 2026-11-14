@@ -82,7 +82,7 @@ on:
         description: "Official-KernelSU (tiann/KernelSU) commit to build. Default 28db74f6 = last commit the SUSFS KernelSU patch is known to apply to. Type main (or latest, or leave empty) for the newest commit."
         required: false
         type: string
-        default: "28db74f6"
+        default: ""
 
       nomount_commit:
         description: "Custom NoMount commit or tag. Leave empty to use the latest commit on master."
