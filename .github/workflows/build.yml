@@ -594,6 +594,23 @@ jobs:
             else
               echo "==> SUSFS: KSU_SUSFS_PRIORITY_UID_FILTER symbol already defined by this tree"
             fi
+
+            # KernelSU-Next (dev-susfs) can call SUSFS helpers that the current susfs4ksu header does not declare
+            # (e.g. susfs_parse_sus_path_app_strings vs SUSFS v2.4.0) -> implicit-declaration error under -Werror.
+            # Only when the header lacks the declaration, comment out the bare call statement. Idempotent; no-op once both sides match.
+            if [[ "${{ matrix.ksu_type }}" == "KernelSU-Next" && -n "${KSU_DIR:-}" && -d "${KSU_DIR}" ]]; then
+              for FN in susfs_parse_sus_path_app_strings; do
+                if ! grep -qw "$FN" include/linux/susfs.h; then
+                  CALLERS=$(grep -rlsE --include='*.c' "^[[:space:]]*${FN}\(\);" "${KSU_DIR}" || true)
+                  if [[ -n "$CALLERS" ]]; then
+                    for SRC in $CALLERS; do
+                      sed -i -E "s|^([[:space:]]*)${FN}\(\);|\1/* ${FN}(): not provided by this SUSFS version, call disabled by build.yml */|" "$SRC"
+                      echo "::warning::SUSFS: ${FN}() is not declared by this susfs.h; disabled its call in ${SRC}"
+                    done
+                  fi
+                fi
+              done
+            fi
           fi
 
           if [[ "${{ env.NOMOUNT }}" == true ]]; then
