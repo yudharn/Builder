@@ -19,7 +19,7 @@ on:
         options:
           - melt-rebase
           - Yudharn-melt-rebase
-          - yudha-linux-lts
+          - yudharn-linux-lts
 
       manager_official_kernelsu:
         description: "Build Official-KernelSU"
