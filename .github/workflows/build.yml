@@ -1050,13 +1050,13 @@ jobs:
             MANAGER_APK=$(jq -r '.manager_apk // ""' "$META")
             if [[ -n "$MANAGER_APK" && -f "${dir}${MANAGER_APK}" && -z "${ROW_APK[$KSU_TYPE]+x}" ]]; then
               ASSETS+=("${dir}${MANAGER_APK}")
-              ROW_APK["$KSU_TYPE"]="\`${MANAGER_APK}\` ([CI $(jq -r '.manager_apk_match' "$META")@$(jq -r '.manager_apk_sha' "$META")]($(jq -r '.manager_apk_url' "$META")))"
+              ROW_APK["$KSU_TYPE"]="$MANAGER_APK"
             fi
 
             if [[ "$KSU_TYPE" == "Vanilla" ]]; then
-              ksu_row_version="—"
+              ksu_row_version=""
             elif [[ -n "$KSU_MANAGER_COMMIT" ]]; then
-              ksu_row_version="${KSU_MANAGER_VERSION}@[${KSU_MANAGER_COMMIT}](${KSU_MANAGER_COMMIT_URL})"
+              ksu_row_version="${KSU_MANAGER_VERSION} ([${KSU_MANAGER_COMMIT}](${KSU_MANAGER_COMMIT_URL}))"
             else
               ksu_row_version="${KSU_MANAGER_VERSION}"
             fi
@@ -1074,109 +1074,101 @@ jobs:
             echo "::warning::No metadata.json found anywhere under artifacts/, skipping"
           fi
 
-          for KSU_TYPE in "${ORDERED_TYPES[@]}"; do
-            MODES_RAW="${ROW_MODES[$KSU_TYPE]}"
-            if [[ "$MODES_RAW" == *"FULL"* && "$MODES_RAW" == *"CORE"* ]]; then
-              MODE_LABEL="FULL&CORE"
-            else
-              MODE_LABEL="$MODES_RAW"
-            fi
-            NOTES_ROWS="${NOTES_ROWS}
-           | ${KSU_TYPE} | ${MODE_LABEL} | ${ROW_VERSION[$KSU_TYPE]} | ${ROW_APK[$KSU_TYPE]:-—} |"
-          done
-
           if [[ ${#ASSETS[@]} -eq 0 ]]; then
             echo "::error::No successful builds found in any matrix leg — skipping release creation."
             exit 1
           fi
 
-          MODES_SELECTED=()
-          [[ "${{ inputs.full_build }}" == true ]] && MODES_SELECTED+=("FULL")
-          [[ "${{ inputs.core_build }}" == true ]] && MODES_SELECTED+=("CORE")
-          [[ "${{ inputs.manager_vanilla }}" == true ]] && MODES_SELECTED+=("VANILLA")
-          MODES_LABEL=""
-          for m in "${MODES_SELECTED[@]}"; do
-            if [[ -z "$MODES_LABEL" ]]; then
-              MODES_LABEL="$m"
-            else
-              MODES_LABEL="${MODES_LABEL} + ${m}"
-            fi
+          # Which zip types actually made it into this release (failed legs are left out of the notes).
+          HAS_FULL=false; HAS_CORE=false; HAS_VANILLA=false
+          for KSU_TYPE in "${ORDERED_TYPES[@]}"; do
+            [[ "${ROW_MODES[$KSU_TYPE]}" == *FULL* ]] && HAS_FULL=true
+            [[ "${ROW_MODES[$KSU_TYPE]}" == *CORE* ]] && HAS_CORE=true
+            [[ "$KSU_TYPE" == "Vanilla" ]] && HAS_VANILLA=true
           done
 
-          if [[ -z "${SUSFS_COMMIT:-}" ]]; then
-            susfs_checkbox="Not included (Vanilla only)"
-          elif [[ -n "${SUSFS_VERSION_TAG:-}" && "$SUSFS_VERSION_TAG" != "unknown" && "$SUSFS_VERSION_TAG" != "null" ]]; then
-            susfs_checkbox="Supported (susfs4ksu ${SUSFS_VERSION_TAG}@[${SUSFS_COMMIT}](${SUSFS_COMMIT_URL}))"
-          else
-            susfs_checkbox="Supported (susfs4ksu@[${SUSFS_COMMIT}](${SUSFS_COMMIT_URL}))"
-          fi
+          valid() { [[ -n "$1" && "$1" != "unknown" && "$1" != "null" ]]; }
 
-          rekernel_netlink_checkbox="Supported"
-          rekernel_ebpf_checkbox="Supported"
-
-          if [[ -n "$NOMOUNT_COMMIT" ]]; then
-            if [[ -n "$NOMOUNT_VERSION_TAG" && "$NOMOUNT_VERSION_TAG" != "unknown" && "$NOMOUNT_VERSION_TAG" != "null" ]]; then
-              nomount_checkbox="Supported (nomount ${NOMOUNT_VERSION_TAG}@[${NOMOUNT_COMMIT}](${NOMOUNT_COMMIT_URL}))"
-            else
-              nomount_checkbox="Supported (nomount@[${NOMOUNT_COMMIT}](${NOMOUNT_COMMIT_URL}))"
+          # Release notes: plain markdown, written like a normal changelog post.
+          NOTES="${GITHUB_WORKSPACE}/release-notes.md"
+          {
+            echo "Melt Rebase kernel for POCO F5 / Redmi Note 12 Turbo (marble), based on Linux ${KERNEL_BASE_VERSION}."
+            echo
+            echo "Supported ROMs: HyperOS, ColorOS, OxygenOS and AOSPA (Paranoid Android)."
+            echo
+            echo "Flash the zip from recovery or with a kernel flasher app. Back up your boot image first."
+            echo
+            echo "**Which zip to pick**"
+            if [[ "$HAS_FULL" == true ]]; then
+              echo "- **FULL**: SuSFS, NoMount, Re-Kernel (Netlink + eBPF), Baseband Guard and DroidSpaces."
             fi
-          else
-            nomount_checkbox="Supported"
-          fi
+            if [[ "$HAS_CORE" == true ]]; then
+              echo "- **CORE**: SuSFS, NoMount and Re-Kernel only, without Baseband Guard and DroidSpaces."
+            fi
+            if [[ "$HAS_VANILLA" == true ]]; then
+              echo "- **Vanilla**: no KernelSU and no SuSFS built in, everything else is on. Root it yourself (KernelSU LKM mode for example)."
+              if [[ -n "${SUSFS_LKM_ZIP:-}" ]]; then
+                echo "  For SuSFS, flash \`${SUSFS_LKM_ZIP}\` as a KernelSU module and reboot. It was built against this exact kernel, so only use it on Vanilla."
+              else
+                echo "  The SuSFS LKM zip failed to build this time, so it's not included."
+              fi
+            fi
 
-          if [[ -n "${SUSFS_LKM_ZIP:-}" ]]; then
-            susfs_lkm_checkbox="Vanilla: \`${SUSFS_LKM_ZIP}\` ([${SUSFS_LKM_TAG}](${SUSFS_LKM_URL}))"
-            vanilla_susfs_cell="🧱 LKM"
-          else
-            susfs_lkm_checkbox="— (LKM build failed or Vanilla not built)"
-            vanilla_susfs_cell="❌"
-          fi
+            MGR_LINES=""
+            for KSU_TYPE in "${ORDERED_TYPES[@]}"; do
+              [[ "$KSU_TYPE" == "Vanilla" ]] && continue
+              MODES_RAW="${ROW_MODES[$KSU_TYPE]}"
+              if [[ "$MODES_RAW" == *FULL* && "$MODES_RAW" == *CORE* ]]; then
+                MODES_TXT="FULL and CORE"
+              else
+                MODES_TXT="$MODES_RAW"
+              fi
+              LINE="- ${KSU_TYPE}"
+              [[ -n "${ROW_VERSION[$KSU_TYPE]}" ]] && LINE="${LINE} ${ROW_VERSION[$KSU_TYPE]}"
+              LINE="${LINE}, ${MODES_TXT}"
+              [[ -n "${ROW_APK[$KSU_TYPE]:-}" ]] && LINE="${LINE}. Manager: \`${ROW_APK[$KSU_TYPE]}\`"
+              MGR_LINES="${MGR_LINES}${LINE}"$'\n'
+            done
+            if [[ -n "$MGR_LINES" ]]; then
+              echo
+              echo "**Root managers**"
+              printf '%s' "$MGR_LINES"
+            fi
+
+            echo
+            echo "**Build info**"
+            echo "- Source: ${{ inputs.kernel_source }} (\`${{ inputs.kernel_branch }}\`, [${KERNEL_COMMIT}](${KERNEL_COMMIT_URL}))"
+            if [[ -n "${SUSFS_COMMIT:-}" ]]; then
+              if valid "${SUSFS_VERSION_TAG:-}"; then
+                echo "- SuSFS ${SUSFS_VERSION_TAG} ([${SUSFS_COMMIT}](${SUSFS_COMMIT_URL}))"
+              else
+                echo "- SuSFS [${SUSFS_COMMIT}](${SUSFS_COMMIT_URL})"
+              fi
+            fi
+            if [[ -n "${NOMOUNT_COMMIT:-}" ]]; then
+              if valid "${NOMOUNT_VERSION_TAG:-}"; then
+                echo "- NoMount ${NOMOUNT_VERSION_TAG} ([${NOMOUNT_COMMIT}](${NOMOUNT_COMMIT_URL}))"
+              else
+                echo "- NoMount [${NOMOUNT_COMMIT}](${NOMOUNT_COMMIT_URL})"
+              fi
+            fi
+            echo "- eBPF with BTF/CO-RE, kprobe/uprobe, cgroup and tc hooks"
+            CLANG_SHORT=$(sed -nE 's/.*clang version ([0-9][0-9.]*).*/\1/p' <<<"$CLANG_VERSION")
+            if [[ -n "$CLANG_SHORT" ]]; then
+              echo "- Compiled with Clang ${CLANG_SHORT}"
+            else
+              echo "- Compiled with ${CLANG_VERSION}"
+            fi
+            echo
+            echo "Built by Yudharn."
+          } > "$NOTES"
+
+          echo "==> Release notes:"
+          cat "$NOTES"
 
           BUILD_TIME=$(date -u +"%Y%m%d_%H%M")
           REL_NAME="${KERNEL_BASE_VERSION}-${KERNEL_NAME}-${BUILD_TIME}"
+          REL_TITLE="${KERNEL_NAME//-/ } ${KERNEL_BASE_VERSION} ($(date -u +'%d %b %Y'))"
 
-          gh release create "$REL_NAME" -R "${RELEASE_REPO}" --title "$REL_NAME" --notes "# Kernel Melt Rebase for POCO F5 (marble)
-
-           | | |
-           |:---|:---|
-           | 📱 Device | POCO F5 (marble) • Redmi Note 12 Turbo (marble) |
-           | 🟠 ROM Support | HyperOS, ColorOS, OxygenOS, AOSPA PARANOID |
-           | 🧰 Kernel Name | ${KERNEL_NAME}
-           | 🔧 Kernel Base | ${KERNEL_BASE_VERSION} |
-           | 🛠️ Build Scope | ZIP |
-           | 🧬 Build Modes in this run | ${MODES_LABEL} |
-           | 📦 Source | ${{ inputs.kernel_source }} |
-           | 🔗 Kernel branch | ${{ inputs.kernel_branch }}@[${KERNEL_COMMIT}](${KERNEL_COMMIT_URL})
-           | ⚙️ SuSFS Version | ${susfs_checkbox}
-           | 🧱 SuSFS LKM | ${susfs_lkm_checkbox} |
-           | 🛡️ Baseband Guard | Supported (Full & Vanilla only) |
-           | 🖥️ Droidspaces | Supported (Full & Vanilla only) |
-           | ⚙️ Re-Kernel (Netlink) | ${rekernel_netlink_checkbox}
-           | ⚙️ Re-Kernel (eBPF) | ${rekernel_ebpf_checkbox}
-           | 🗂️ NoMount | ${nomount_checkbox}
-           | 🧩 eBPF | Enabled (BTF/CO-RE, kprobe+uprobe, cgroup+tc hooks) |
-           | 🔨 Compiler | ${CLANG_VERSION} |
-
-           ---
-
-           ### 🧬 Full vs Core vs Vanilla
-
-           NoMount and Re-Kernel (Netlink+eBPF) are enabled in all zip packages in this release. SuSFS is enabled in every KernelSU zip. BBG and DroidSpaces are only available in the FULL and VANILLA builds — check the 'Mode' column in the manager table below to see which zip is FULL, CORE or VANILLA.
-           
-           | Mode | SuSFS | NoMount | BBG | Re-Kernel Netlink | Re-Kernel eBPF | DroidSpaces |
-           |:---|:---:|:---:|:---:|:---:|:---:|:---:|
-           | **FULL** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-           | **CORE** | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ |
-           | **VANILLA** | ${vanilla_susfs_cell} | ✅ | ✅ | ✅ | ✅ | ✅ |
-
-           > **Vanilla**: no KernelSU manager and no SuSFS built in. Every other feature is on. Built once per run (ignores Full/Core). Install root yourself (e.g. KernelSU LKM mode), then flash \`SuSFS-LKM_*.zip\` from this release (built against this exact kernel) as a KernelSU module and reboot. Never use the LKM zip on FULL/CORE.
-
-           ---
-
-           ### 💻 KSU Managers in this build
-
-           | Manager | Mode | Version | Manager APK |
-           |:---|:---:|:---|:---|${NOTES_ROWS}
-
-           ---
-          " "${ASSETS[@]}"
+          gh release create "$REL_NAME" -R "${RELEASE_REPO}" --title "$REL_TITLE" --notes-file "$NOTES" "${ASSETS[@]}"
+          
