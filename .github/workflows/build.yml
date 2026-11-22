@@ -1092,9 +1092,8 @@ jobs:
           # Release notes: plain markdown, written like a normal changelog post.
           NOTES="${GITHUB_WORKSPACE}/release-notes.md"
           {
-            echo "Melt Rebase kernel for POCO F5 / Redmi Note 12 Turbo (marble), based on Linux ${KERNEL_BASE_VERSION}."
-            echo
-            echo "Supported ROMs: HyperOS, ColorOS, OxygenOS and AOSPA (Paranoid Android)."
+            echo "**Melt Rebase kernel for POCO F5 / Redmi Note 12 Turbo (marble), based on Linux ${KERNEL_BASE_VERSION}**."
+            echo "**Supported ROMs**: HyperOS, ColorOS, OxygenOS and AOSPA (Paranoid Android)."
             echo
             echo "Flash the zip from recovery or with a kernel flasher app. Back up your boot image first."
             echo
