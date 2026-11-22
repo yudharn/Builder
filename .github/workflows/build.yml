@@ -1105,9 +1105,9 @@ jobs:
               echo "- **CORE**: SuSFS, NoMount and Re-Kernel only, without Baseband Guard and DroidSpaces."
             fi
             if [[ "$HAS_VANILLA" == true ]]; then
-              echo "- **Vanilla**: no KernelSU and no SuSFS built in, everything else is on. Root it yourself (KernelSU LKM mode for example)."
+              echo "- **Vanilla**: no KernelSU and no SuSFS built in, everything else is on. Root it yourself (KernelSU Next LKM mode for example)."
               if [[ -n "${SUSFS_LKM_ZIP:-}" ]]; then
-                echo "  For SuSFS, flash \`${SUSFS_LKM_ZIP}\` as a KernelSU module and reboot. It was built against this exact kernel, so only use it on Vanilla."
+                echo "  For SuSFS, flash \`${SUSFS_LKM_ZIP}\` as a KernelSU Next module and reboot. It was built against this exact kernel, so only use it on Vanilla."
               else
                 echo "  The SuSFS LKM zip failed to build this time, so it's not included."
               fi
