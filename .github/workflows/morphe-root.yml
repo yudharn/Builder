@@ -372,7 +372,7 @@ jobs:
           HAVE=$(gh api "repos/$RELEASE_REPO/releases/latest" --jq '.assets[].name' 2>/dev/null || true)
           if [ "$FORCE_BUILD" != "true" ] && grep -qxF "$NAME" <<< "$HAVE"; then
             echo "$NAME is already in the latest release, reusing it instead of rebuilding."
-            gh release download -R "$RELEASE_REPO" -p "$NAME" -p "$NAME.sha256" -D out --clobber
+            gh release download -R "$RELEASE_REPO" -p "$NAME" -D out --clobber
             echo "reused" > "out/$TAG_PREFIX.status"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -434,7 +434,7 @@ jobs:
           [ -f "$OUT" ] || { echo "::error::Patched APK not found"; exit 1; }
           python3 -I bins/has_arch.py "$OUT" "$REQ_ARCH" \
             || { echo "::error::Patched APK has no $REQ_ARCH native libs, it would crash on launch"; exit 1; }
-          sha256sum "$OUT" | tee "$OUT.sha256"
+          sha256sum "$OUT"
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
 
       - name: Write release notes for ${{ matrix.app }}
@@ -491,7 +491,7 @@ jobs:
           # is carried over from the latest release so the release always has both.
           for pat in 'YouTube-[0-9]*' 'YouTube-Music-*'; do
             if ! compgen -G "$pat.apk" >/dev/null; then
-              gh release download -R "$RELEASE_REPO" -p "$pat" -D . 2>/dev/null \
+              gh release download -R "$RELEASE_REPO" -p "$pat.apk" -D . 2>/dev/null \
                 && echo "Carried over $pat from the latest release" \
                 || echo "No previous $pat to carry over"
             fi
@@ -532,4 +532,4 @@ jobs:
           gh release delete "$TAG" -R "$RELEASE_REPO" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" -R "$RELEASE_REPO" --latest \
             --title "$TITLE" --notes-file notes.md \
-            ./*.apk ./*.apk.sha256
+            ./*.apk
