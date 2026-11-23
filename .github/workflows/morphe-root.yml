@@ -1,0 +1,535 @@
+name: Morphe YouTube + YouTube Music (Root / no MicroG)
+
+# What it does:
+#  1. Fetch the latest Morphe CLI + Morphe patches (dev or stable channel)
+#  2. For each app: find the newest version SUPPORTED by those patches
+#  3. Download the stock APK (APKPure via apkeep, or from apk_url)
+#  4. Patch WITHOUT "GmsCore support" -> original package name (no MicroG)
+#  5. Upload to GitHub Releases (skipped if this version combo was already built)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: "Apps to build"
+        type: choice
+        options: [all, youtube, music]
+        default: all
+      patches_channel:
+        description: "Morphe patches channel"
+        type: choice
+        options: [dev, stable]
+        default: dev
+      youtube_version:
+        description: "YouTube version (empty = latest supported)"
+        type: string
+        default: ""
+      music_version:
+        description: "YouTube Music version (empty = latest supported)"
+        type: string
+        default: ""
+      youtube_apk_url:
+        description: "Optional: direct link to a stock YouTube APK"
+        type: string
+        default: ""
+      music_apk_url:
+        description: "Optional: direct link to a stock YouTube Music APK (arm64-v8a)"
+        type: string
+        default: ""
+      include_experimental:
+        description: "Include experimental versions (the newest one is usually experimental)"
+        type: boolean
+        default: true
+      striplibs:
+        description: "Native lib architectures to keep (empty = all)"
+        type: string
+        default: "arm64-v8a"
+      signature:
+        description: "original = keep Google's signature (accounts survive updates), custom = sign with your keystore"
+        type: choice
+        options: [original, custom]
+        default: original
+      force_build:
+        description: "Rebuild even if a release with the same versions exists"
+        type: boolean
+        default: false
+  schedule:
+    # Every day at 19:17 UTC
+    - cron: "17 19 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: morphe-root
+  cancel-in-progress: false
+
+env:
+  CHANNEL: ${{ inputs.patches_channel || 'dev' }}
+  INCLUDE_EXPERIMENTAL: ${{ github.event_name == 'schedule' || inputs.include_experimental }}
+  STRIPLIBS: ${{ github.event_name == 'schedule' && 'arm64-v8a' || inputs.striplibs }}
+  FORCE_BUILD: ${{ github.event_name != 'schedule' && inputs.force_build }}
+  SIGNATURE: ${{ inputs.signature || 'original' }}
+  GH_TOKEN: ${{ github.token }}
+  # Releases are published here (needs the MORPHE_PAT secret, see README)
+  RELEASE_REPO: yudharn/YouTube-Morphe
+  # Name of the Morphe entry in the app settings
+  SETTINGS_TITLE: "Morphe (Patch By Yudharn)"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      cli_tag: ${{ steps.plan.outputs.cli_tag }}
+      patch_tag: ${{ steps.plan.outputs.patch_tag }}
+    steps:
+      - name: Check access to the release repo
+        env:
+          GH_TOKEN: ${{ secrets.MORPHE_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::MORPHE_PAT secret is missing. Add a token with Contents read/write access to $RELEASE_REPO."
+            exit 1
+          fi
+          PERM=$(gh api "repos/$RELEASE_REPO" --jq '.permissions.push' 2>/dev/null || echo false)
+          if [ "$PERM" != "true" ]; then
+            echo "::error::MORPHE_PAT cannot push to $RELEASE_REPO. Check the token's repository access and Contents permission."
+            exit 1
+          fi
+          echo "Releases will be published to $RELEASE_REPO"
+
+      - name: Resolve Morphe versions & app list
+        id: plan
+        env:
+          APPS: ${{ inputs.apps || 'all' }}
+        run: |
+          set -euo pipefail
+          # dev = newest release (pre-releases included), stable = the "latest" release
+          pick_tag() {
+            if [ "$CHANNEL" = "dev" ]; then
+              gh api "repos/$1/releases?per_page=30" --jq '[.[] | select(.draft | not)][0].tag_name'
+            else
+              gh api "repos/$1/releases/latest" --jq '.tag_name'
+            fi
+          }
+          CLI_TAG=$(pick_tag MorpheApp/morphe-desktop)
+          PATCH_TAG=$(pick_tag MorpheApp/morphe-patches)
+          echo "Morphe CLI : $CLI_TAG"
+          echo "Patches    : $PATCH_TAG"
+
+          YT='{"id":"youtube","app":"YouTube","pkg":"com.google.android.youtube","arch":"arm64-v8a"}'
+          YTM='{"id":"music","app":"YouTube Music","pkg":"com.google.android.apps.youtube.music","arch":"arm64-v8a"}'
+          case "$APPS" in
+            youtube) M="[$YT]" ;;
+            music)   M="[$YTM]" ;;
+            *)       M="[$YT,$YTM]" ;;
+          esac
+
+          {
+            echo "cli_tag=$CLI_TAG"
+            echo "patch_tag=$PATCH_TAG"
+            echo "matrix={\"include\":$M}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: ${{ matrix.app }}
+    env:
+      APP: ${{ matrix.app }}
+      PKG: ${{ matrix.pkg }}
+      TAG_PREFIX: ${{ matrix.id }}
+      APK_ARCH: ${{ matrix.arch }}
+      CLI_TAG: ${{ needs.plan.outputs.cli_tag }}
+      PATCH_TAG: ${{ needs.plan.outputs.patch_tag }}
+      APP_VERSION: ${{ matrix.id == 'youtube' && inputs.youtube_version || matrix.id == 'music' && inputs.music_version || '' }}
+      APK_URL: ${{ matrix.id == 'youtube' && inputs.youtube_apk_url || matrix.id == 'music' && inputs.music_apk_url || '' }}
+    steps:
+      - name: Setup Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download Morphe CLI, patches & apkeep
+        run: |
+          set -euo pipefail
+          mkdir -p bins
+          export MORPHE_DATA_DIR="$RUNNER_TEMP/morphe-data"; mkdir -p "$MORPHE_DATA_DIR"
+          echo "MORPHE_DATA_DIR=$MORPHE_DATA_DIR" >> "$GITHUB_ENV"
+
+          gh release download "$CLI_TAG" -R MorpheApp/morphe-desktop -p '*-all.jar' -O bins/morphe.jar --clobber
+          gh release download "$PATCH_TAG" -R MorpheApp/morphe-patches -p '*.mpp' -O bins/patches.mpp --clobber
+          gh release download -R EFForg/apkeep -p 'apkeep-x86_64-unknown-linux-gnu' -O bins/apkeep --clobber
+          chmod +x bins/apkeep
+          java -jar bins/morphe.jar --version || true
+
+      - name: Write helper scripts
+        run: |
+          cat > bins/keep_original_signature.py <<'PY'
+          #!/usr/bin/env python3
+          """Copy the APK Signing Block (v2/v3) from a stock APK into a patched, unsigned APK.
+
+          usage: keep_original_signature.py <stock.apk|.apkm|.xapk|.apks> <patched-unsigned.apk> <out.apk>
+          """
+          import io
+          import struct
+          import sys
+          import zipfile
+
+          MAGIC = b"APK Sig Block 42"
+
+
+          def locate(d):
+              eocd = d.rfind(b"PK\x05\x06", max(0, len(d) - 65557))
+              if eocd < 0:
+                  sys.exit("not a zip file")
+              cd = struct.unpack_from("<I", d, eocd + 16)[0]
+              z64 = None
+              if cd == 0xFFFFFFFF:
+                  loc = d.rfind(b"PK\x06\x07", 0, eocd)
+                  z64 = struct.unpack_from("<Q", d, loc + 8)[0]
+                  cd = struct.unpack_from("<Q", d, z64 + 48)[0]
+              start = cd
+              if d[cd - 16:cd] == MAGIC:
+                  size = struct.unpack_from("<Q", d, cd - 24)[0]
+                  start = cd - size - 8
+              return start, cd, eocd, z64
+
+
+          def base_apk(path):
+              d = open(path, "rb").read()
+              if path.endswith(".apk"):
+                  return d
+              with zipfile.ZipFile(io.BytesIO(d)) as z:
+                  apks = [i for i in z.infolist() if i.filename.endswith(".apk")]
+                  base = [i for i in apks if i.filename.split("/")[-1] == "base.apk"]
+                  main = base[0] if base else max(apks, key=lambda i: i.file_size)
+                  return z.read(main)
+
+
+          def main():
+              stock, patched, out = sys.argv[1:4]
+              s = base_apk(stock)
+              s_start, s_cd, _, _ = locate(s)
+              if s_start == s_cd:
+                  sys.exit("stock APK has no v2/v3 signing block")
+              block = s[s_start:s_cd]
+
+              p = open(patched, "rb").read()
+              p_start, p_cd, _, _ = locate(p)
+              p = p[:p_start] + p[p_cd:]          # drop an existing block, if any
+              _, cd, eocd, z64 = locate(p)
+
+              new = bytearray(p[:cd] + block + p[cd:])
+              shift = len(block)
+              new_cd = cd + shift
+              struct.pack_into("<I", new, eocd + shift + 16, min(new_cd, 0xFFFFFFFF))
+              if z64 is not None:
+                  struct.pack_into("<Q", new, z64 + shift + 48, new_cd)
+                  loc = bytes(new).rfind(b"PK\x06\x07", 0, eocd + shift)
+                  struct.pack_into("<Q", new, loc + 8, z64 + shift)
+
+              open(out, "wb").write(new)
+              print(f"signing block copied ({len(block)} bytes) -> {out}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          cat > bins/set_settings_title.py <<'PY'
+          #!/usr/bin/env python3
+          """Change the Morphe settings entry name inside a patches .mpp bundle.
+
+          usage: set_settings_title.py <patches.mpp> "<new title>"
+          """
+          import html
+          import os
+          import re
+          import sys
+          import zipfile
+
+          ENTRY = "addresources/values/shared/strings.xml"
+          PATTERN = re.compile(r'(<string name="morphe_settings_title"[^>]*>)[^<]*(</string>)')
+
+
+          def main():
+              mpp, title = sys.argv[1], sys.argv[2]
+              tmp = mpp + ".tmp"
+              found = False
+              with zipfile.ZipFile(mpp) as src, zipfile.ZipFile(tmp, "w") as dst:
+                  for info in src.infolist():
+                      data = src.read(info)
+                      if info.filename == ENTRY:
+                          text, n = PATTERN.subn(lambda m: m.group(1) + html.escape(title, quote=False) + m.group(2),
+                                                 data.decode("utf-8"))
+                          found = n == 1
+                          data = text.encode("utf-8")
+                      dst.writestr(info, data, compress_type=info.compress_type)
+              if not found:
+                  os.remove(tmp)
+                  sys.exit(f"morphe_settings_title not found in {ENTRY}, the patches layout changed")
+              os.replace(tmp, mpp)
+              print(f"settings title set to: {title}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python3 -I bins/set_settings_title.py bins/patches.mpp "$SETTINGS_TITLE"
+
+          # has_arch.py <apk|apkm|xapk|apks> <arch> : exit 0 only if native libs for <arch> are present
+          cat > bins/has_arch.py <<'PY'
+          import collections, io, sys, zipfile
+          path, arch = sys.argv[1], sys.argv[2]
+          abis = collections.Counter()
+          found = 0
+          def scan(z, where):
+              global found
+              for n in z.namelist():
+                  if n.startswith("lib/") and n.endswith(".so"):
+                      abi = n.split("/")[1]
+                      abis[f"{where}:{abi}"] += 1
+                      found += abi == arch
+          with zipfile.ZipFile(path) as z:
+              scan(z, "base")
+              for n in z.namelist():
+                  if n.endswith(".apk"):
+                      try:
+                          scan(zipfile.ZipFile(io.BytesIO(z.read(n))), n)
+                      except Exception as e:
+                          print(f"  cannot read {n}: {e}")
+              if not found:
+                  print("  entries:", ", ".join(n for n in z.namelist() if "/" not in n)[:600])
+          print(f"{path}: {found} native libs for {arch}; seen: {dict(abis) or 'none'}")
+          sys.exit(0 if found else 1)
+          PY
+
+      - name: Find supported ${{ matrix.app }} versions
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_VERSION" ]; then
+            echo "$APP_VERSION" > candidates.txt
+          else
+            X=""; if [ "$INCLUDE_EXPERIMENTAL" = "true" ]; then X="-x"; fi
+            java -jar bins/morphe.jar list-versions --patches bins/patches.mpp -f "$PKG" $X 2>&1 | tee versions.txt
+            # Grab every version string (e.g. 21.46.522 / 9.46.51), newest first
+            grep -oE '\b[0-9]{1,2}\.[0-9]{2}\.[0-9]{2,3}\b' versions.txt | sort -uVr | head -n 5 > candidates.txt
+          fi
+          [ -s candidates.txt ] || { echo "::error::No supported $APP versions found"; exit 1; }
+          echo "Candidates (newest first):"; cat candidates.txt
+
+      - name: Download stock ${{ matrix.app }} APK
+        id: apk
+        run: |
+          set -euo pipefail
+          mkdir -p apk
+          # The arch the patched APK must keep: first entry of striplibs, arm64-v8a by default
+          REQ_ARCH="${STRIPLIBS%%,*}"; REQ_ARCH="${REQ_ARCH:-arm64-v8a}"
+          echo "REQ_ARCH=$REQ_ARCH" >> "$GITHUB_ENV"
+          GOT=""; VER=""
+          if [ -n "$APK_URL" ]; then
+            curl -fL --retry 3 -o apk/original.apk "$APK_URL"
+            python3 -I bins/has_arch.py apk/original.apk "$REQ_ARCH" \
+              || { echo "::error::apk_url APK has no $REQ_ARCH native libs"; exit 1; }
+            GOT=apk/original.apk; VER=$(head -n1 candidates.txt)
+            [ -n "$APP_VERSION" ] || echo "::warning::apk_url given without a version, assuming $VER"
+          else
+            while read -r v; do
+              echo "== Trying $APP $v from APKPure =="
+              rm -rf apk/*
+              if ./bins/apkeep -a "$PKG@$v" -d apk-pure -o "acknowledge_dangers=true,arch=$APK_ARCH" apk/ ; then
+                f=$(find apk -maxdepth 1 -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.apkm' \) | head -n1)
+                if [ -n "$f" ] && unzip -tq "$f" >/dev/null 2>&1; then
+                  if python3 -I bins/has_arch.py "$f" "$REQ_ARCH"; then GOT="$f"; VER="$v"; break; fi
+                  echo "::warning::$f has no $REQ_ARCH native libs, skipping it"
+                fi
+              fi
+              echo "Failed or not available, trying the next version..."
+            done < candidates.txt
+          fi
+          [ -n "$GOT" ] || { echo "::error::Could not download the $APP APK. Pass a direct link to a stock APK via the apk_url input."; exit 1; }
+          ls -la apk
+          echo "file=$GOT" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Check the latest release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.MORPHE_PAT }}
+        run: |
+          set -euo pipefail
+          NAME="${APP// /-}-${{ steps.apk.outputs.version }}-Morphe-${PATCH_TAG#v}-ROOT.apk"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          HAVE=$(gh api "repos/$RELEASE_REPO/releases/latest" --jq '.assets[].name' 2>/dev/null || true)
+          if [ "$FORCE_BUILD" != "true" ] && grep -qxF "$NAME" <<< "$HAVE"; then
+            echo "$NAME is already in the latest release, reusing it instead of rebuilding."
+            gh release download -R "$RELEASE_REPO" -p "$NAME" -p "$NAME.sha256" -D out --clobber
+            echo "reused" > "out/$TAG_PREFIX.status"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare keystore
+        if: steps.check.outputs.skip != 'true' && env.SIGNATURE == 'custom'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+          KEYSTORE_ENTRY_PASSWORD: ${{ secrets.KEYSTORE_ENTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : > ks_args.txt
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/morphe.keystore"
+            ENTRY_PW="${KEYSTORE_ENTRY_PASSWORD:-${KEYSTORE_PASSWORD:-}}"
+            printf '%s\n' --keystore "$RUNNER_TEMP/morphe.keystore" > ks_args.txt
+            if [ -n "${KEYSTORE_PASSWORD:-}" ]; then printf '%s\n' --keystore-password "$KEYSTORE_PASSWORD" >> ks_args.txt; fi
+            if [ -n "${KEYSTORE_ALIAS:-}" ]; then printf '%s\n' --keystore-entry-alias "$KEYSTORE_ALIAS" >> ks_args.txt; fi
+            if [ -n "$ENTRY_PW" ]; then printf '%s\n' --keystore-entry-password "$ENTRY_PW" >> ks_args.txt; fi
+            echo "Using keystore from secrets."
+          else
+            echo "::warning::KEYSTORE_BASE64 is not set: signing with a random key (still installs fine with signature verification disabled)."
+          fi
+
+      - name: Patch ${{ matrix.app }} (no GmsCore/MicroG)
+        if: steps.check.outputs.skip != 'true'
+        id: patch
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          OUT="out/${{ steps.check.outputs.name }}"
+
+          # -d "GmsCore support" : no MicroG, keep the original package name
+          # -d "Custom branding" : keep the original app icon & name
+          PATCHED="$OUT"
+          if [ "$SIGNATURE" = "original" ]; then PATCHED="out/unsigned.apk"; fi
+
+          ARGS=(patch -p bins/patches.mpp -d "GmsCore support" -d "Custom branding" -o "$PATCHED" -r out/result.json --continue-on-error)
+          if [ -n "$STRIPLIBS" ]; then ARGS+=(--striplibs "$STRIPLIBS"); fi
+          if [ "$SIGNATURE" = "original" ]; then
+            # Build unsigned, then put the stock APK's Google signing block back on it
+            ARGS+=(--unsigned)
+          else
+            mapfile -t KS < ks_args.txt
+            ARGS+=("${KS[@]}")
+          fi
+
+          java -jar bins/morphe.jar "${ARGS[@]}" "${{ steps.apk.outputs.file }}"
+
+          if [ "$SIGNATURE" = "original" ]; then
+            python3 -I bins/keep_original_signature.py "${{ steps.apk.outputs.file }}" "$PATCHED" "$OUT"
+            rm -f "$PATCHED"
+          fi
+
+          [ -f "$OUT" ] || { echo "::error::Patched APK not found"; exit 1; }
+          python3 -I bins/has_arch.py "$OUT" "$REQ_ARCH" \
+            || { echo "::error::Patched APK has no $REQ_ARCH native libs, it would crash on launch"; exit 1; }
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes for ${{ matrix.app }}
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          FAILED=$(jq -r '.failedPatches[]? | (.name // .patchName // tostring)' out/result.json 2>/dev/null || true)
+          {
+            echo "### $APP ${{ steps.apk.outputs.version }}"
+            echo "Package: \`$PKG\`"
+            if [ -n "$FAILED" ]; then
+              echo; echo "⚠️ Patches that failed to apply:"; while read -r l; do echo "- $l"; done <<< "$FAILED"
+            fi
+          } > "out/$TAG_PREFIX.md"
+          echo "built" > "out/$TAG_PREFIX.status"
+          rm -f out/result.json
+
+      - name: Upload ${{ matrix.app }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: apk-${{ matrix.id }}
+          path: out/
+          retention-days: 3
+
+  release:
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      CLI_TAG: ${{ needs.plan.outputs.cli_tag }}
+      PATCH_TAG: ${{ needs.plan.outputs.patch_tag }}
+    steps:
+      - name: Collect builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: apk-*
+          merge-multiple: true
+          path: out
+
+      - name: Create one release for both apps
+        env:
+          GH_TOKEN: ${{ secrets.MORPHE_PAT }}
+        run: |
+          set -euo pipefail
+          mkdir -p out && cd out
+          ls -la
+
+          if ! ls ./*.status >/dev/null 2>&1 || ! grep -qx built ./*.status; then
+            echo "Nothing new was built, no release needed."
+            exit 0
+          fi
+
+          # An app that wasn't built this run (not selected, or its build failed)
+          # is carried over from the latest release so the release always has both.
+          for pat in 'YouTube-[0-9]*' 'YouTube-Music-*'; do
+            if ! compgen -G "$pat.apk" >/dev/null; then
+              gh release download -R "$RELEASE_REPO" -p "$pat" -D . 2>/dev/null \
+                && echo "Carried over $pat from the latest release" \
+                || echo "No previous $pat to carry over"
+            fi
+          done
+
+          YT=$(compgen -G 'YouTube-[0-9]*.apk' | head -n1 | sed -E 's/^YouTube-([^-]+)-.*/\1/' || true)
+          YTM=$(compgen -G 'YouTube-Music-*.apk' | head -n1 | sed -E 's/^YouTube-Music-([^-]+)-.*/\1/' || true)
+
+          TAG="morphe-${PATCH_TAG}"
+          TITLE=""
+          if [ -n "$YT" ]; then TAG="$TAG-yt-$YT"; TITLE="YouTube $YT"; fi
+          if [ -n "$YTM" ]; then TAG="$TAG-ytm-$YTM"; TITLE="${TITLE:+$TITLE & }YouTube Music $YTM"; fi
+          TITLE="$TITLE · Morphe $PATCH_TAG (Root)"
+
+          {
+            echo "**Morphe patches** $PATCH_TAG · CLI $CLI_TAG"
+            echo
+            echo "Settings entry: **$SETTINGS_TITLE**"
+            echo
+            echo "Root builds without MicroG. \`GmsCore support\` and \`Custom branding\` are disabled, so the package name, icon and app name stay original."
+            if [ "${SIGNATURE}" = "original" ]; then
+              echo "The APKs carry the original Google signature, so your account stays signed in across updates. Signature/digest verification has to be disabled on the device (CorePatch or similar)."
+            else
+              echo "Signed with a custom keystore. Install over the stock apps with signature verification disabled."
+            fi
+            echo
+            echo "Native libs: ${STRIPLIBS:-all architectures}"
+            for id in youtube music; do
+              name="YouTube"; [ "$id" = "music" ] && name="YouTube Music"
+              [ -f "$id.md" ] && { echo; cat "$id.md"; }
+              if [ -f "$id.status" ] && [ "$(cat "$id.status")" = "reused" ]; then
+                echo; echo "_${name}: unchanged since the previous release._"
+              fi
+            done
+            true
+          } > notes.md
+
+          gh release delete "$TAG" -R "$RELEASE_REPO" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" -R "$RELEASE_REPO" --latest \
+            --title "$TITLE" --notes-file notes.md \
+            ./*.apk ./*.apk.sha256
