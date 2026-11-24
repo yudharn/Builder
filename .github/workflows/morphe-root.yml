@@ -41,9 +41,9 @@ on:
         type: boolean
         default: true
       striplibs:
-        description: "Native lib architectures to keep, e.g. arm64-v8a (empty = keep all)"
+        description: "Native lib architectures to keep (empty = keep all)"
         type: string
-        default: ""
+        default: "arm64-v8a"
       signature:
         description: "original = keep Google's signature (accounts survive updates), custom = sign with your keystore"
         type: choice
@@ -67,7 +67,7 @@ concurrency:
 env:
   CHANNEL: ${{ inputs.patches_channel || 'dev' }}
   INCLUDE_EXPERIMENTAL: ${{ github.event_name == 'schedule' || inputs.include_experimental }}
-  STRIPLIBS: ${{ inputs.striplibs || '' }}
+  STRIPLIBS: ${{ github.event_name == 'schedule' && 'arm64-v8a' || inputs.striplibs }}
   FORCE_BUILD: ${{ github.event_name != 'schedule' && inputs.force_build }}
   SIGNATURE: ${{ inputs.signature || 'original' }}
   GH_TOKEN: ${{ github.token }}
@@ -119,10 +119,10 @@ jobs:
           echo "Patches    : $PATCH_TAG"
 
           # Where to look for each stock APK; certs = Google's signing certificates (SHA-256) from the Morphe patches.
-          # variant "all" = universal APK. YouTube Music has no universal APK signed by Google, only per-arch ones.
+          # variant: the arch to look for (a universal APK also qualifies; striplibs trims it afterwards).
           YT=$(jq -nc '{
             id: "youtube", app: "YouTube", pkg: "com.google.android.youtube",
-            variant: "all", libs: "arm64-v8a,armeabi-v7a", arch: "arm64-v8a;armeabi-v7a;x86;x86_64",
+            variant: "arm64-v8a", libs: "arm64-v8a", arch: "arm64-v8a",
             apkmirror: "https://www.apkmirror.com/apk/google-inc/youtube",
             uptodown: "https://youtube.en.uptodown.com/android",
             archive: "https://archive.org/download/jhc-apks/apks/com.google.android.youtube",
@@ -478,6 +478,80 @@ jobs:
                   fail(f"{src}: {e}")
           PY
 
+          cat > bins/test_zip.py <<'PY'
+          #!/usr/bin/env python3
+          """Read every entry of an APK or bundle (and of the APKs inside a bundle) to check its CRC.
+
+          usage: test_zip.py <apk|apkm|xapk|apks>
+          """
+          import io
+          import sys
+          import zipfile
+
+
+          def test(z, where):
+              bad = []
+              for i in z.infolist():
+                  try:
+                      data = z.read(i)
+                  except Exception as e:
+                      bad.append(f"{where}{i.filename}: {e}")
+                      continue
+                  if i.filename.endswith(".apk"):
+                      try:
+                          bad += test(zipfile.ZipFile(io.BytesIO(data)), f"{where}{i.filename}!")
+                      except zipfile.BadZipFile as e:
+                          bad.append(f"{where}{i.filename}: {e}")
+              return bad
+
+
+          path = sys.argv[1]
+          try:
+              bad = test(zipfile.ZipFile(path), "")
+          except zipfile.BadZipFile as e:
+              bad = [str(e)]
+          print(f"{path}: {'all entries OK' if not bad else f'{len(bad)} corrupted entries'}")
+          for b in bad[:10]:
+              print("  corrupted:", b)
+          sys.exit(1 if bad else 0)
+          PY
+
+          cat > bins/check_align.py <<'PY'
+          #!/usr/bin/env python3
+          """Check that uncompressed native libs are page aligned (4 KB minimum, 16 KB reported)
+          and that an uncompressed resources.arsc is 4-byte aligned, as Android requires to install.
+
+          usage: check_align.py <apk>
+          """
+          import struct
+          import sys
+          import zipfile
+
+          path = sys.argv[1]
+          bad, stored_libs, not16 = [], 0, 0
+          with open(path, "rb") as f, zipfile.ZipFile(path) as z:
+              for i in z.infolist():
+                  if i.compress_type != zipfile.ZIP_STORED:
+                      continue
+                  f.seek(i.header_offset)
+                  hdr = f.read(30)
+                  name_len, extra_len = struct.unpack_from("<HH", hdr, 26)
+                  data = i.header_offset + 30 + name_len + extra_len
+                  if i.filename.endswith(".so"):
+                      stored_libs += 1
+                      if data % 4096:
+                          bad.append(f"{i.filename} @ {data}")
+                      elif data % 16384:
+                          not16 += 1
+                  elif i.filename == "resources.arsc" and data % 4:
+                      bad.append(f"resources.arsc @ {data}")
+
+          print(f"{path}: {stored_libs} uncompressed libs, {len(bad)} misaligned, {not16} only 4 KB aligned")
+          for b in bad[:10]:
+              print("  misaligned:", b)
+          sys.exit(1 if bad else 0)
+          PY
+
           cat > bins/base_apk.py <<'PY'
           #!/usr/bin/env python3
           """Write the base APK of an APK or bundle (apkm/xapk/apks) to <out>.
@@ -626,7 +700,7 @@ jobs:
 
           # check <file> <source> <version>: full zip, right version, REQ_ARCH libs and (signature=original) Google's signature
           check() {
-            unzip -tq "$1" >/dev/null 2>&1 || { echo "::warning::$2: $1 is not a valid archive"; return 1; }
+            python3 -I bins/test_zip.py "$1" || { echo "::warning::$2: $1 is corrupted, skipping it"; return 1; }
             if [ -n "$AAPT2" ]; then
               python3 -I bins/base_apk.py "$1" "$RUNNER_TEMP/base.apk"
               local got; got=$("$AAPT2" dump badging "$RUNNER_TEMP/base.apk" 2>/dev/null | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n1)
@@ -748,11 +822,19 @@ jobs:
           java -jar bins/morphe.jar "${ARGS[@]}" "${{ steps.apk.outputs.file }}"
 
           if [ "$SIGNATURE" = "original" ]; then
+            # --unsigned skips the signing step, and with it the zip alignment: uncompressed native libs
+            # must sit on page boundaries or Android refuses the APK ("Failed to extract native libraries")
+            ZIPALIGN=$(find "${ANDROID_HOME:-/nonexistent}/build-tools" -name zipalign -type f 2>/dev/null | sort -V | tail -n1 || true)
+            [ -n "$ZIPALIGN" ] || { echo "::error::zipalign not found in the Android SDK"; exit 1; }
+            "$ZIPALIGN" -f -P 16 4 "$PATCHED" "$PATCHED.aligned" 2>/dev/null || "$ZIPALIGN" -f -p 4 "$PATCHED" "$PATCHED.aligned"
+            mv -f "$PATCHED.aligned" "$PATCHED"
             python3 -I bins/keep_original_signature.py "${{ steps.apk.outputs.file }}" "$PATCHED" "$OUT"
             rm -f "$PATCHED"
           fi
 
           [ -f "$OUT" ] || { echo "::error::Patched APK not found"; exit 1; }
+          python3 -I bins/test_zip.py "$OUT" || { echo "::error::Patched APK is corrupted"; exit 1; }
+          python3 -I bins/check_align.py "$OUT" || { echo "::error::Patched APK is not aligned, Android would refuse to install it"; exit 1; }
           python3 -I bins/has_arch.py "$OUT" "$REQ_ARCH" \
             || { echo "::error::Patched APK is missing native libs for $REQ_ARCH"; exit 1; }
           sha256sum "$OUT"
@@ -839,7 +921,7 @@ jobs:
               echo "Signed with a custom keystore. Install over the stock apps with signature verification disabled."
             fi
             echo
-            echo "Native libs: ${STRIPLIBS:-YouTube universal (all architectures), YouTube Music arm64-v8a (Google ships no universal build of it)}"
+            echo "Native libs: ${STRIPLIBS:-all architectures}"
             for id in youtube music; do
               name="YouTube"; [ "$id" = "music" ] && name="YouTube Music"
               [ -f "$id.md" ] && { echo; cat "$id.md"; }
@@ -847,7 +929,12 @@ jobs:
                 echo; echo "_${name}: unchanged since the previous release._"
               fi
             done
-            true
+            echo
+            echo "### SHA-256"
+            echo "Check your download against these before installing, a broken download crashes or fails to install."
+            echo '```'
+            for f in ./*.apk; do sha256sum "$f" | sed 's#  \./#  #'; done
+            echo '```'
           } > notes.md
 
           gh release delete "$TAG" -R "$RELEASE_REPO" --yes --cleanup-tag 2>/dev/null || true
