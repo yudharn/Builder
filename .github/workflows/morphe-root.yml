@@ -41,9 +41,9 @@ on:
         type: boolean
         default: true
       striplibs:
-        description: "Native lib architectures to keep (empty = all)"
+        description: "Native lib architectures to keep, e.g. arm64-v8a (empty = keep all)"
         type: string
-        default: "arm64-v8a"
+        default: ""
       signature:
         description: "original = keep Google's signature (accounts survive updates), custom = sign with your keystore"
         type: choice
@@ -67,7 +67,7 @@ concurrency:
 env:
   CHANNEL: ${{ inputs.patches_channel || 'dev' }}
   INCLUDE_EXPERIMENTAL: ${{ github.event_name == 'schedule' || inputs.include_experimental }}
-  STRIPLIBS: ${{ github.event_name == 'schedule' && 'arm64-v8a' || inputs.striplibs }}
+  STRIPLIBS: ${{ inputs.striplibs || '' }}
   FORCE_BUILD: ${{ github.event_name != 'schedule' && inputs.force_build }}
   SIGNATURE: ${{ inputs.signature || 'original' }}
   GH_TOKEN: ${{ github.token }}
@@ -118,8 +118,24 @@ jobs:
           echo "Morphe CLI : $CLI_TAG"
           echo "Patches    : $PATCH_TAG"
 
-          YT='{"id":"youtube","app":"YouTube","pkg":"com.google.android.youtube","arch":"arm64-v8a"}'
-          YTM='{"id":"music","app":"YouTube Music","pkg":"com.google.android.apps.youtube.music","arch":"arm64-v8a"}'
+          # Where to look for each stock APK; certs = Google's signing certificates (SHA-256) from the Morphe patches.
+          # variant "all" = universal APK. YouTube Music has no universal APK signed by Google, only per-arch ones.
+          YT=$(jq -nc '{
+            id: "youtube", app: "YouTube", pkg: "com.google.android.youtube",
+            variant: "all", libs: "arm64-v8a,armeabi-v7a", arch: "arm64-v8a;armeabi-v7a;x86;x86_64",
+            apkmirror: "https://www.apkmirror.com/apk/google-inc/youtube",
+            uptodown: "https://youtube.en.uptodown.com/android",
+            archive: "https://archive.org/download/jhc-apks/apks/com.google.android.youtube",
+            certs: "5aad2bee6db95d17e05a08d7d1e64c10a1511879154483916b6ae6c7fd9cb0c6,3d7a1223019aa39d9ea0e3436ab7c0896bfb4fb679f4de5fe7c23f326c8f994a"
+          }')
+          YTM=$(jq -nc '{
+            id: "music", app: "YouTube Music", pkg: "com.google.android.apps.youtube.music",
+            variant: "arm64-v8a", libs: "arm64-v8a", arch: "arm64-v8a",
+            apkmirror: "https://www.apkmirror.com/apk/google-inc/youtube-music",
+            uptodown: "https://youtube-music.en.uptodown.com/android",
+            archive: "https://archive.org/download/jhc-apks/apks/com.google.android.apps.youtube.music",
+            certs: "6a2f65ec694a6a632acdcb5080912a565f903d4b8d83f0eb8e44fbdf2660d8e1,a2a1ad7ba7f41dfca4514e2afeb90691719af6d0fdbed4b09bbf0ed897701ceb"
+          }')
           case "$APPS" in
             youtube) M="[$YT]" ;;
             music)   M="[$YTM]" ;;
@@ -145,6 +161,14 @@ jobs:
       PKG: ${{ matrix.pkg }}
       TAG_PREFIX: ${{ matrix.id }}
       APK_ARCH: ${{ matrix.arch }}
+      VARIANT: ${{ matrix.variant }}
+      APP_LIBS: ${{ matrix.libs }}
+      APKMIRROR_URL: ${{ matrix.apkmirror }}
+      UPTODOWN_URL: ${{ matrix.uptodown }}
+      ARCHIVE_URL: ${{ matrix.archive }}
+      GPLAY_EMAIL: ${{ secrets.GPLAY_EMAIL }}
+      GPLAY_AAS_TOKEN: ${{ secrets.GPLAY_AAS_TOKEN }}
+      OFFICIAL_CERTS: ${{ matrix.certs }}
       CLI_TAG: ${{ needs.plan.outputs.cli_tag }}
       PATCH_TAG: ${{ needs.plan.outputs.patch_tag }}
       APP_VERSION: ${{ matrix.id == 'youtube' && inputs.youtube_version || matrix.id == 'music' && inputs.music_version || '' }}
@@ -285,19 +309,279 @@ jobs:
 
           python3 -I bins/set_settings_title.py bins/patches.mpp "$SETTINGS_TITLE"
 
-          # has_arch.py <apk|apkm|xapk|apks> <arch> : exit 0 only if native libs for <arch> are present
+          cat > bins/fetch_apk.py <<'PY'
+          #!/usr/bin/env python3
+          """Download a stock APK from APKMirror, Uptodown or archive.org.
+
+          usage: fetch_apk.py apkmirror <app page url> <version> <arch> <out file without extension>
+                 fetch_apk.py uptodown  <app url ending in /android> <version> <arch> <out file without extension>
+                 fetch_apk.py archive   <archive.org folder url> <version> <arch> <out file without extension>
+
+          Prints the saved path on success. Exit code 1 when the version or a matching variant isn't found.
+          Variant choice follows j-hc/revanced-magisk-module.
+          """
+          import http.cookiejar
+          import json
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+
+          from bs4 import BeautifulSoup
+
+          UA = "Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"
+          jar = http.cookiejar.CookieJar()
+          opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+          def get(url, binary=False):
+              req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+              with opener.open(req, timeout=60) as r:
+                  data = r.read()
+              return data if binary else data.decode("utf-8", "replace")
+
+
+          def soup(url):
+              return BeautifulSoup(get(url), "html.parser")
+
+
+          def save(url, path):
+              data = get(url, binary=True)
+              if data[:2] != b"PK":
+                  raise RuntimeError(f"not a zip file (got {len(data)} bytes, probably a block page)")
+              with open(path, "wb") as f:
+                  f.write(data)
+              return path
+
+
+          def fail(msg):
+              print(msg, file=sys.stderr)
+              sys.exit(1)
+
+
+          def apkmirror(page, version, arch, out):
+              page = page.rstrip("/")
+              slug = page.rsplit("/", 1)[-1]
+              release = f"{page}/{slug}-{version.replace('.', '-')}-release/"
+              try:
+                  s = soup(release)
+              except Exception as e:
+                  fail(f"apkmirror: release page not found ({e})")
+
+              # arch "all" = universal only; otherwise universal or that single arch
+              ok_arch = ["universal", "noarch", "arm64-v8a + armeabi-v7a"] + ([] if arch == "all" else [arch])
+              ok_dpi = {"nodpi", "anydpi"}
+              pick, rank = None, len(ok_arch)
+              for row in s.select("div.table-row.headerFont"):
+                  link = row.select_one("a.accent_color[href]") or row.select_one("a[href]")
+                  if not link or "-download" not in link["href"]:
+                      continue
+                  tokens = [t.strip() for t in row.get_text("\n").split("\n") if t.strip()]
+                  kind = "BUNDLE" if "BUNDLE" in tokens else ("APK" if "APK" in tokens else None)
+                  row_arch = next((t for t in tokens if t in ok_arch or "arm" in t or "x86" in t or t in ("universal", "noarch")), "")
+                  dpi = next((t for t in tokens if "dpi" in t), "")
+                  # Full APK only: a bundle would have to be merged and re-signed, losing Google's signature
+                  if kind == "APK" and row_arch in ok_arch and dpi in ok_dpi and ok_arch.index(row_arch) < rank:
+                      pick = urllib.parse.urljoin("https://www.apkmirror.com", link["href"])
+                      rank = ok_arch.index(row_arch)
+              if not pick:
+                  fail("apkmirror: no full APK variant for this arch")
+
+              s = soup(pick)
+              btn = s.select_one("a.downloadButton[href]") or s.select_one("a.btn[href]")
+              if not btn:
+                  fail("apkmirror: download button not found")
+              s = soup(urllib.parse.urljoin("https://www.apkmirror.com", btn["href"]))
+              final = s.select_one('a[rel="nofollow"][href*="download.php"]') or s.select_one('span > a[rel="nofollow"][href]')
+              if not final:
+                  fail("apkmirror: final download link not found")
+              print(save(urllib.parse.urljoin("https://www.apkmirror.com", final["href"]), out + ".apk"))
+
+
+          def uptodown(base, version, arch, out):
+              base = base.rstrip("/")
+              host = base.rsplit("/", 1)[0]
+              s = soup(base + "/versions")
+              node = s.select_one("#detail-app-name[data-code]")
+              if not node:
+                  fail("uptodown: app code not found")
+              code = node["data-code"]
+
+              page = None
+              is_bundle = False
+              for i in range(1, 21):
+                  try:
+                      data = json.loads(get(f"{base}/apps/{code}/versions/{i}")).get("data") or []
+                  except Exception:
+                      break
+                  if not data:
+                      break
+                  hit = next((d for d in data if d.get("version") == version), None)
+                  if hit:
+                      is_bundle = hit.get("kindFile") == "xapk"
+                      v = hit.get("versionURL")
+                      page = v if isinstance(v, str) else f"{v['url']}/{v['extraURL']}/{v['versionID']}"
+                      break
+              if not page:
+                  fail("uptodown: version not listed")
+
+              s = soup(page)
+              variants = s.select_one(".button.variants[data-version]")
+              if variants:
+                  ok_arch = ["arm64-v8a, armeabi-v7a, x86, x86_64", "arm64-v8a, armeabi-v7a, x86_64",
+                             "arm64-v8a, armeabi-v7a"] + ([] if arch == "all" else [arch])
+                  content = json.loads(get(f"{host}/app/{code}/version/{variants['data-version']}/files"))["content"]
+                  files = BeautifulSoup(content, "html.parser")
+                  root = files.select_one(".content") or files
+                  cur_arch, file_id = "", None
+                  for child in root.find_all(recursive=False):
+                      if "variant" not in (child.get("class") or []):
+                          cur_arch = " ".join(child.get_text(" ").split())
+                          continue
+                      if cur_arch not in ok_arch:
+                          continue
+                      ftype = child.select_one(".v-file > span")
+                      report = child.select_one(".v-report[data-file-id]")
+                      if report:
+                          is_bundle = bool(ftype and ftype.get_text(strip=True) == "xapk")
+                          file_id = report["data-file-id"]
+                          break
+                  if not file_id:
+                      fail("uptodown: no variant for this arch")
+                  s = soup(f"{base}/download/{file_id}-x")
+
+              btn = s.select_one("#detail-download-button[data-url]")
+              if not btn:
+                  fail("uptodown: download button not found")
+              print(save(f"https://dw.uptodown.com/dwn/{btn['data-url']}", out + (".xapk" if is_bundle else ".apk")))
+
+
+          def archive(folder, version, arch, out):
+              folder = folder.rstrip("/")
+              hrefs = re.findall(r'<a href="([^"?]+)"', get(folder + "/"))
+              for tag in ((f"-{version}-all.",) if arch == "all" else (f"-{version}-{arch}.", f"-{version}-all.")):
+                  hit = next((h for h in hrefs if tag in urllib.parse.unquote(h) and h.endswith((".apk", ".apkm"))), None)
+                  if hit:
+                      ext = ".apkm" if hit.endswith(".apkm") else ".apk"
+                      print(save(urllib.parse.urljoin(folder + "/", hit), out + ext))
+                      return
+              fail("archive: version not in the folder")
+
+
+          if __name__ == "__main__":
+              src, url, version, arch, out = sys.argv[1:6]
+              try:
+                  {"apkmirror": apkmirror, "uptodown": uptodown, "archive": archive}[src](url, version, arch, out)
+              except SystemExit:
+                  raise
+              except Exception as e:
+                  fail(f"{src}: {e}")
+          PY
+
+          cat > bins/base_apk.py <<'PY'
+          #!/usr/bin/env python3
+          """Write the base APK of an APK or bundle (apkm/xapk/apks) to <out>.
+
+          usage: base_apk.py <apk|apkm|xapk|apks> <out.apk>
+          """
+          import io
+          import sys
+          import zipfile
+
+          src, out = sys.argv[1], sys.argv[2]
+          d = open(src, "rb").read()
+          with zipfile.ZipFile(io.BytesIO(d)) as z:
+              if "AndroidManifest.xml" not in z.namelist():
+                  apks = [i for i in z.infolist() if i.filename.endswith(".apk")]
+                  base = [i for i in apks if i.filename.split("/")[-1] == "base.apk"]
+                  d = z.read(base[0] if base else max(apks, key=lambda i: i.file_size))
+          open(out, "wb").write(d)
+          PY
+
+          cat > bins/verify_sig.py <<'PY'
+          #!/usr/bin/env python3
+          """Check that a stock APK (or the base APK inside a bundle) is signed with an expected certificate.
+
+          usage: verify_sig.py <apk|apkm|xapk|apks> <sha256>[,<sha256>...]
+          """
+          import hashlib
+          import io
+          import struct
+          import sys
+          import zipfile
+
+          BLOCK_IDS = (0x7109871A, 0xF05368C0, 0x1B93AD61)  # v2, v3, v3.1
+
+
+          def base_apk(path):
+              d = open(path, "rb").read()
+              with zipfile.ZipFile(io.BytesIO(d)) as z:
+                  if "AndroidManifest.xml" in z.namelist():
+                      return d
+                  apks = [i for i in z.infolist() if i.filename.endswith(".apk")]
+                  base = [i for i in apks if i.filename.split("/")[-1] == "base.apk"]
+                  main = base[0] if base else max(apks, key=lambda i: i.file_size)
+                  return z.read(main)
+
+
+          def lp(b, o):
+              n = struct.unpack_from("<I", b, o)[0]
+              return b[o + 4:o + 4 + n], o + 4 + n
+
+
+          def certs(d):
+              eocd = d.rfind(b"PK\x05\x06")
+              cd = struct.unpack_from("<I", d, eocd + 16)[0]
+              if d[cd - 16:cd] != b"APK Sig Block 42":
+                  return set()
+              size = struct.unpack_from("<Q", d, cd - 24)[0]
+              blk = d[cd - size - 8:cd]
+              found, p = set(), 8
+              while p < len(blk) - 24:
+                  n, i = struct.unpack_from("<QI", blk, p)
+                  if i in BLOCK_IDS:
+                      val = blk[p + 12:p + 8 + n]
+                      signers, _ = lp(val, 0)
+                      o = 0
+                      while o < len(signers):
+                          signer, o = lp(signers, o)
+                          sd, _ = lp(signer, 0)
+                          _, q = lp(sd, 0)            # digests
+                          cl, _ = lp(sd, q)           # certificates
+                          c = 0
+                          while c < len(cl):
+                              cert, c = lp(cl, c)
+                              found.add(hashlib.sha256(cert).hexdigest())
+                  p += 8 + n
+              return found
+
+
+          if __name__ == "__main__":
+              path, wanted = sys.argv[1], set(sys.argv[2].lower().split(","))
+              try:
+                  got = certs(base_apk(path))
+              except Exception as e:
+                  print(f"{path}: cannot read signature ({e})")
+                  sys.exit(1)
+              ok = bool(got & wanted)
+              print(f"{path}: signature {'OK (official)' if ok else 'NOT official'}; certs: {', '.join(sorted(g[:16] for g in got)) or 'none'}")
+              sys.exit(0 if ok else 1)
+          PY
+
+          sudo python3 -m pip install --quiet --break-system-packages beautifulsoup4
+
           cat > bins/has_arch.py <<'PY'
           import collections, io, sys, zipfile
-          path, arch = sys.argv[1], sys.argv[2]
+          # has_arch.py <apk|apkm|xapk|apks> <arch>[,<arch>...] : exit 0 only if native libs for every listed arch are present
+          path, want = sys.argv[1], sys.argv[2].split(",")
           abis = collections.Counter()
-          found = 0
+          per = collections.Counter()
           def scan(z, where):
-              global found
               for n in z.namelist():
                   if n.startswith("lib/") and n.endswith(".so"):
                       abi = n.split("/")[1]
                       abis[f"{where}:{abi}"] += 1
-                      found += abi == arch
+                      per[abi] += 1
           with zipfile.ZipFile(path) as z:
               scan(z, "base")
               for n in z.namelist():
@@ -306,10 +590,11 @@ jobs:
                           scan(zipfile.ZipFile(io.BytesIO(z.read(n))), n)
                       except Exception as e:
                           print(f"  cannot read {n}: {e}")
-              if not found:
-                  print("  entries:", ", ".join(n for n in z.namelist() if "/" not in n)[:600])
-          print(f"{path}: {found} native libs for {arch}; seen: {dict(abis) or 'none'}")
-          sys.exit(0 if found else 1)
+          missing = [a for a in want if not per[a]]
+          if missing:
+              print("  entries:", ", ".join(n for n in zipfile.ZipFile(path).namelist() if "/" not in n)[:600])
+          print(f"{path}: libs per arch {dict(per) or 'none'}; missing: {', '.join(missing) or 'none'}; seen: {dict(abis) or 'none'}")
+          sys.exit(1 if missing else 0)
           PY
 
       - name: Find supported ${{ matrix.app }} versions
@@ -321,41 +606,77 @@ jobs:
             X=""; if [ "$INCLUDE_EXPERIMENTAL" = "true" ]; then X="-x"; fi
             java -jar bins/morphe.jar list-versions --patches bins/patches.mpp -f "$PKG" $X 2>&1 | tee versions.txt
             # Grab every version string (e.g. 21.46.522 / 9.46.51), newest first
-            grep -oE '\b[0-9]{1,2}\.[0-9]{2}\.[0-9]{2,3}\b' versions.txt | sort -uVr | head -n 5 > candidates.txt
+            # Only the newest supported version: no falling back to older ones
+            grep -oE '\b[0-9]{1,2}\.[0-9]{2}\.[0-9]{2,3}\b' versions.txt | sort -uVr | head -n 1 > candidates.txt
           fi
           [ -s candidates.txt ] || { echo "::error::No supported $APP versions found"; exit 1; }
-          echo "Candidates (newest first):"; cat candidates.txt
+          echo "Target version: $(cat candidates.txt)"
 
       - name: Download stock ${{ matrix.app }} APK
         id: apk
         run: |
           set -euo pipefail
           mkdir -p apk
-          # The arch the patched APK must keep: first entry of striplibs, arm64-v8a by default
-          REQ_ARCH="${STRIPLIBS%%,*}"; REQ_ARCH="${REQ_ARCH:-arm64-v8a}"
+          # Native libs that must be present: the striplibs list if set, else the app's own list
+          REQ_ARCH="${STRIPLIBS:-$APP_LIBS}"; REQ_ARCH="${REQ_ARCH// /}"
           echo "REQ_ARCH=$REQ_ARCH" >> "$GITHUB_ENV"
           GOT=""; VER=""
+
+          AAPT2=$(find "${ANDROID_HOME:-/nonexistent}/build-tools" -name aapt2 -type f 2>/dev/null | sort -V | tail -n1 || true)
+
+          # check <file> <source> <version>: full zip, right version, REQ_ARCH libs and (signature=original) Google's signature
+          check() {
+            unzip -tq "$1" >/dev/null 2>&1 || { echo "::warning::$2: $1 is not a valid archive"; return 1; }
+            if [ -n "$AAPT2" ]; then
+              python3 -I bins/base_apk.py "$1" "$RUNNER_TEMP/base.apk"
+              local got; got=$("$AAPT2" dump badging "$RUNNER_TEMP/base.apk" 2>/dev/null | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n1)
+              [ "$got" = "$3" ] || { echo "::warning::$2: $1 is version '$got', not $3, skipping it"; return 1; }
+            fi
+            python3 -I bins/has_arch.py "$1" "$REQ_ARCH" || { echo "::warning::$2: $1 is missing native libs for $REQ_ARCH, skipping it"; return 1; }
+            if ! python3 -I bins/verify_sig.py "$1" "$OFFICIAL_CERTS"; then
+              if [ "$SIGNATURE" = "original" ]; then
+                echo "::warning::$2: $1 is not signed by Google (merged or re-signed), skipping it"; return 1
+              fi
+              echo "::warning::$2: $1 is not signed by Google, accepted because signature=custom"
+            fi
+          }
+
+          try_source() { # <source> <version>
+            rm -rf apk/*
+            case "$1" in
+              apkmirror) python3 bins/fetch_apk.py apkmirror "$APKMIRROR_URL" "$2" "$VARIANT" "apk/$PKG@$2" || return 1 ;;
+              uptodown)  python3 bins/fetch_apk.py uptodown "$UPTODOWN_URL" "$2" "$VARIANT" "apk/$PKG@$2" || return 1 ;;
+              archive)   python3 bins/fetch_apk.py archive "$ARCHIVE_URL" "$2" "$VARIANT" "apk/$PKG@$2" || return 1 ;;
+              apkpure)
+                ./bins/apkeep -a "$PKG@$2" -d apk-pure -o "acknowledge_dangers=true,arch=$APK_ARCH" apk/ || return 1 ;;
+              googleplay)
+                # Play only serves its current version; the version check below rejects anything else
+                [ -n "${GPLAY_EMAIL:-}" ] && [ -n "${GPLAY_AAS_TOKEN:-}" ] || { echo "no GPLAY_EMAIL/GPLAY_AAS_TOKEN secrets, skipping"; return 1; }
+                ./bins/apkeep -a "$PKG" -d google-play -e "$GPLAY_EMAIL" -t "$GPLAY_AAS_TOKEN" \
+                  -o "split_apk=true,device=px_9a" apk/ || return 1
+                # split download: zip the parts into one .apks bundle
+                local d; d=$(find apk -mindepth 1 -maxdepth 1 -type d | head -n1)
+                if [ -n "$d" ]; then (cd "$d" && zip -q -0 "../$PKG@play.apks" ./*.apk) && rm -rf "$d"; fi ;;
+            esac
+            local f; f=$(find apk -maxdepth 1 -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.apkm' -o -name '*.apks' \) | head -n1)
+            [ -n "$f" ] && check "$f" "$1" "$2" && GOT="$f"
+          }
+
           if [ -n "$APK_URL" ]; then
             curl -fL --retry 3 -o apk/original.apk "$APK_URL"
-            python3 -I bins/has_arch.py apk/original.apk "$REQ_ARCH" \
-              || { echo "::error::apk_url APK has no $REQ_ARCH native libs"; exit 1; }
+            check apk/original.apk apk_url "$(head -n1 candidates.txt)" || { echo "::error::The APK from apk_url can't be used (see the warning above)"; exit 1; }
             GOT=apk/original.apk; VER=$(head -n1 candidates.txt)
             [ -n "$APP_VERSION" ] || echo "::warning::apk_url given without a version, assuming $VER"
           else
             while read -r v; do
-              echo "== Trying $APP $v from APKPure =="
-              rm -rf apk/*
-              if ./bins/apkeep -a "$PKG@$v" -d apk-pure -o "acknowledge_dangers=true,arch=$APK_ARCH" apk/ ; then
-                f=$(find apk -maxdepth 1 -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.apkm' \) | head -n1)
-                if [ -n "$f" ] && unzip -tq "$f" >/dev/null 2>&1; then
-                  if python3 -I bins/has_arch.py "$f" "$REQ_ARCH"; then GOT="$f"; VER="$v"; break; fi
-                  echo "::warning::$f has no $REQ_ARCH native libs, skipping it"
-                fi
-              fi
-              echo "Failed or not available, trying the next version..."
+              for src in apkmirror uptodown archive apkpure googleplay; do
+                echo "== Trying $APP $v from $src =="
+                if try_source "$src" "$v"; then VER="$v"; break 2; fi
+                echo "Not usable from $src"
+              done
             done < candidates.txt
           fi
-          [ -n "$GOT" ] || { echo "::error::Could not download the $APP APK. Pass a direct link to a stock APK via the apk_url input."; exit 1; }
+          [ -n "$GOT" ] || { echo "::error::$APP $(cat candidates.txt) (newest supported) is not available yet on APKMirror, Uptodown, archive.org, APKPure or Google Play. Try again later, or pass a direct link via the apk_url input."; exit 1; }
           ls -la apk
           echo "file=$GOT" >> "$GITHUB_OUTPUT"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
@@ -433,7 +754,7 @@ jobs:
 
           [ -f "$OUT" ] || { echo "::error::Patched APK not found"; exit 1; }
           python3 -I bins/has_arch.py "$OUT" "$REQ_ARCH" \
-            || { echo "::error::Patched APK has no $REQ_ARCH native libs, it would crash on launch"; exit 1; }
+            || { echo "::error::Patched APK is missing native libs for $REQ_ARCH"; exit 1; }
           sha256sum "$OUT"
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
 
@@ -482,7 +803,7 @@ jobs:
           mkdir -p out && cd out
           ls -la
 
-          if ! ls ./*.status >/dev/null 2>&1 || ! grep -qx built ./*.status; then
+          if ! compgen -G './*.status' >/dev/null || ! grep -qx built ./*.status; then
             echo "Nothing new was built, no release needed."
             exit 0
           fi
@@ -518,7 +839,7 @@ jobs:
               echo "Signed with a custom keystore. Install over the stock apps with signature verification disabled."
             fi
             echo
-            echo "Native libs: ${STRIPLIBS:-all architectures}"
+            echo "Native libs: ${STRIPLIBS:-YouTube universal (all architectures), YouTube Music arm64-v8a (Google ships no universal build of it)}"
             for id in youtube music; do
               name="YouTube"; [ "$id" = "music" ] && name="YouTube Music"
               [ -f "$id.md" ] && { echo; cat "$id.md"; }
@@ -533,3 +854,4 @@ jobs:
           gh release create "$TAG" -R "$RELEASE_REPO" --latest \
             --title "$TITLE" --notes-file notes.md \
             ./*.apk
+            
